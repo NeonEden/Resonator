@@ -1,0 +1,6 @@
+{
+  "summary": "Plan de implementacion para la Consola Neural Bridge de Resonator: generador de presets sonoros por IA con Gemini 3.8 Flash, modulos acusticos distintivos (Modulacion Cruzada FM y Modulador en Anillo), biblioteca de presets ilimitada con busqueda y etiquetas, y sincronizacion completa con el motor de Web Audio API y el nucleo de plasma.",
+  "updatedAt": "2026-11-03T19:40:13.750940112Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

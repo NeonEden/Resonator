@@ -1,0 +1,6 @@
+{
+  "name": "Resonator // Model 01 Opulence",
+  "description": "Modular web synthesizer with an Obsidian Futurism aesthetic, physical tactile controls, reactive plasma core, and native Web Audio API engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
