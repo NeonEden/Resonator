@@ -249,10 +249,17 @@ export const PatchMatrix: React.FC<PatchMatrixProps> = ({ cables, onCablesChange
         </div>
       </div>
 
-      {/* Helper text */}
-      <div className="w-full text-center mt-1">
-        <span className="font-['JetBrains_Mono'] text-[8px] text-[#9e8e7c]">
-          {selectedJackId ? 'SELECCIONA OTRO JACK' : 'CLIC EN JACK PARA PARCHEAR'}
+      {/* Helper & Route Explanation Banner */}
+      <div className="w-full text-center mt-1 px-1">
+        <span className="font-['JetBrains_Mono'] text-[8px] text-[#9e8e7c] block truncate">
+          {selectedJackId
+            ? `PARCHEAR DESDE ${MATRIX_JACKS.find(j => j.id === selectedJackId)?.name} → ELIGE ENTRADA/SALIDA`
+            : cables.length > 0
+            ? `${cables.length} RUTAS ACTIVAS: ${cables.map(c => `${c.fromId.split('-')[0].toUpperCase()}→${c.toId.replace('vcf-', '').replace('vco-', '').toUpperCase()}`).join(', ')}`
+            : 'CLIC EN JACKS PARA MODULAR EN TIEMPO REAL'}
+        </span>
+        <span className="font-['JetBrains_Mono'] text-[7px] text-[#7a6f62] block truncate mt-0.5">
+          [GATE / RND Reservados para Expansión CV Secuenciador]
         </span>
       </div>
     </div>

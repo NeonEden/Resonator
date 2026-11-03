@@ -156,26 +156,31 @@ export const Knob: React.FC<KnobProps> = ({
           />
         </svg>
 
-        {/* Knurled Metal Cylinder Knob Body */}
+        {/* Stationary Illuminated Knob Body (Fixed Top-Left Light Source) */}
         <div
-          className={`relative rounded-full transition-transform duration-75 flex items-center justify-center ${
-            color === 'cyan'
-              ? 'bg-gradient-to-br from-[#85f4f9] via-[#1da0a5] to-[#002f31]'
-              : 'knurled-dial'
-          }`}
+          className="relative rounded-full flex items-center justify-center border border-[#ad7655]/60 bg-gradient-to-br from-[#3e4246] via-[#202326] to-[#0d0f11] shadow-[inset_0_1.5px_2px_rgba(255,255,255,0.35),0_6px_14px_rgba(0,0,0,0.9)]"
           style={{
             width: dim,
             height: dim,
-            transform: `rotate(${angle}deg)`,
           }}
         >
-          {/* Knurled Outer Ridges (tactile notches around the edge) */}
-          <div className="absolute inset-0 rounded-full border border-[#ffd9aa]/40 shadow-[inset_0_2px_4px_rgba(255,255,255,0.4),0_3px_6px_rgba(0,0,0,0.7)]" />
+          {/* Knurled Outer Metallic Ridge Rim */}
+          <div className="absolute inset-0 rounded-full border border-[#ffd9aa]/20 shadow-[inset_0_1px_1px_rgba(255,255,255,0.3)] pointer-events-none" />
 
-          {/* Machined Center Core */}
-          <div className="w-[70%] h-[70%] rounded-full bg-gradient-to-b from-[#292c2d] to-[#121416] border border-[#59351a] shadow-[inset_0_2px_3px_rgba(0,0,0,0.9)] flex items-start justify-center pt-0.5">
-            {/* Screen-Printed Ivory / Amber Indicator Notch */}
-            <div className="w-[2px] h-[38%] rounded-full bg-[#ffe58a] shadow-[0_0_4px_#ffb545]" />
+          {/* Machined Inner Core */}
+          <div className="w-[72%] h-[72%] rounded-full bg-gradient-to-br from-[#2a2d30] via-[#141618] to-[#08090a] border border-[#59351a] shadow-[inset_0_2px_4px_rgba(0,0,0,0.95)] flex items-center justify-center relative overflow-hidden">
+            
+            {/* ROTATING INDICATOR DISC (Only indicator line rotates!) */}
+            <div
+              className="absolute inset-0 flex items-start justify-center pt-0.5 transition-transform duration-75"
+              style={{ transform: `rotate(${angle}deg)` }}
+            >
+              {/* Screen-Printed Luminous Amber/Ivory Indicator Marker */}
+              <div className="w-[2.5px] h-[40%] rounded-full bg-gradient-to-b from-[#ffffff] via-[#ffe58a] to-[#ffb545] shadow-[0_0_6px_#ffb545]" />
+            </div>
+
+            {/* Stationary Center Brass Cap (Fixed Top-Left Reflection) */}
+            <div className="w-[30%] h-[30%] rounded-full bg-gradient-to-br from-[#ffd9aa] via-[#ad7655] to-[#3a1d08] border border-[#ffb545]/60 shadow-[inset_0_1px_1px_rgba(255,255,255,0.6)]" />
           </div>
         </div>
 

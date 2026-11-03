@@ -111,8 +111,8 @@ export const Keyboard: React.FC<KeyboardProps> = ({
                 }}
                 className={`relative flex-1 h-full mx-[1px] rounded-b-[3px] transition-transform duration-75 flex flex-col justify-end items-center pb-2.5 ${
                   isActive
-                    ? 'translate-y-[3px] shadow-[inset_0_3px_6px_rgba(0,0,0,0.9),0_0_12px_rgba(255,181,69,0.4)] bg-gradient-to-b from-[#181a1c] via-[#222527] to-[#2d3033]'
-                    : 'shadow-[0_5px_8px_rgba(0,0,0,0.8),inset_0_1px_1px_rgba(255,255,255,0.18)] bg-gradient-to-b from-[#26282b] via-[#1f2123] to-[#16181a] hover:brightness-115'
+                    ? 'translate-y-[3px] shadow-[inset_0_3px_6px_rgba(0,0,0,0.95),0_0_14px_rgba(255,181,69,0.45)] bg-gradient-to-br from-[#121416] via-[#202325] to-[#2a2d30]'
+                    : 'shadow-[0_6px_10px_rgba(0,0,0,0.85),inset_0_1.5px_1px_rgba(255,255,255,0.22)] bg-gradient-to-br from-[#2f3236] via-[#1f2123] to-[#141618] hover:brightness-115'
                 }`}
                 style={{
                   border: '1px solid #36393b',
