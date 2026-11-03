@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Sparkles, Brain, Loader2, BookmarkPlus, Library, Wand2, AlertCircle } from 'lucide-react';
+import { Sparkles, Brain, Loader2, BookmarkPlus, Library, Wand2, AlertCircle, Volume2 } from 'lucide-react';
 import { ResonatorPresetJson } from '../audio/presetSchema';
 import { parseAndValidatePresetJson } from '../audio/presetManager';
 
@@ -7,6 +7,8 @@ interface NeuralBridgeProps {
   onPresetGenerated: (preset: ResonatorPresetJson) => void;
   onOpenLibrary: () => void;
   onSaveCurrentPreset: () => void;
+  onPlayPreview?: () => void;
+  onEngageAudio?: () => void;
   currentPresetName: string;
   currentAuthor: string;
   currentWave: string;
@@ -29,6 +31,8 @@ export const NeuralBridge: React.FC<NeuralBridgeProps> = ({
   onPresetGenerated,
   onOpenLibrary,
   onSaveCurrentPreset,
+  onPlayPreview,
+  onEngageAudio,
   currentPresetName,
   currentAuthor,
   currentWave,
@@ -47,6 +51,10 @@ export const NeuralBridge: React.FC<NeuralBridgeProps> = ({
     if (!textToUse) {
       setErrorMsg('Escribe un concepto sonoro o selecciona una sugerencia.');
       return;
+    }
+
+    if (onEngageAudio) {
+      onEngageAudio();
     }
 
     setIsGenerating(true);
@@ -242,6 +250,19 @@ export const NeuralBridge: React.FC<NeuralBridgeProps> = ({
               title={`Color de plasma: ${currentPlasmaColor}`}
             />
           </div>
+
+          {/* Audio Preview Demo Button */}
+          {onPlayPreview && (
+            <button
+              type="button"
+              onClick={onPlayPreview}
+              className="flex items-center gap-1 px-2.5 py-0.5 rounded-[2px] bg-[#182a1e] hover:bg-[#203a2a] border border-[#59cbd0]/60 text-[#59cbd0] text-[9px] font-['JetBrains_Mono'] font-bold transition-all shadow-[0_0_8px_rgba(89,203,208,0.25)]"
+              title="Escuchar demostración sonora del preset activo"
+            >
+              <Volume2 className="w-2.5 h-2.5 text-[#59cbd0]" />
+              <span>PROBAR DEMO</span>
+            </button>
+          )}
 
           {/* Quick Save Button */}
           <button

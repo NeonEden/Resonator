@@ -11,7 +11,8 @@ import {
   Trash2,
   Check,
   Disc,
-  X
+  X,
+  Volume2
 } from 'lucide-react';
 
 interface PresetBarProps {
@@ -22,6 +23,7 @@ interface PresetBarProps {
   onDeletePreset: (name: string) => void;
   onImportPreset: (preset: ResonatorPresetJson) => void;
   onOpenLibrary?: () => void;
+  onPlayPreview?: () => void;
   activeAuthor?: string;
 }
 
@@ -33,6 +35,7 @@ export const PresetBar: React.FC<PresetBarProps> = ({
   onDeletePreset,
   onImportPreset,
   onOpenLibrary,
+  onPlayPreview,
   activeAuthor = 'TOMAS.WAV',
 }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -194,6 +197,17 @@ export const PresetBar: React.FC<PresetBarProps> = ({
 
       {/* Right Section: Preset Action Buttons (+ Guardar, Exportar, Importar, Biblioteca) */}
       <div className="flex items-center gap-1.5 shrink-0 w-full md:w-auto justify-end">
+        {/* Probar Demo Sound Preview */}
+        {onPlayPreview && (
+          <button
+            onClick={onPlayPreview}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-[2px] bg-[#182a1e] hover:bg-[#203a2a] border border-[#59cbd0]/60 text-[8px] font-['JetBrains_Mono'] font-bold text-[#59cbd0] transition-all hover:shadow-[0_0_8px_rgba(89,203,208,0.3)]"
+            title="Escuchar prueba de sonido del preset activo"
+          >
+            <Volume2 className="w-3 h-3 text-[#59cbd0]" />
+            <span>DEMO</span>
+          </button>
+        )}
         {/* Biblioteca Ilimitada */}
         {onOpenLibrary && (
           <button

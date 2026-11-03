@@ -14,6 +14,7 @@ import {
   Calendar,
   User,
   Check,
+  Volume2,
 } from 'lucide-react';
 import { ResonatorPresetJson } from '../audio/presetSchema';
 import { exportPresetAsJson } from '../audio/presetManager';
@@ -26,6 +27,7 @@ interface PresetLibraryModalProps {
   onSelectPreset: (preset: ResonatorPresetJson) => void;
   onDeletePreset: (name: string) => void;
   onImportPreset: (jsonStr: string) => void;
+  onPlayPreview?: (preset: ResonatorPresetJson) => void;
 }
 
 const PRESET_TAGS = [
@@ -47,6 +49,7 @@ export const PresetLibraryModal: React.FC<PresetLibraryModalProps> = ({
   onSelectPreset,
   onDeletePreset,
   onImportPreset,
+  onPlayPreview,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedTag, setSelectedTag] = useState('TODOS');
@@ -322,6 +325,21 @@ export const PresetLibraryModal: React.FC<PresetLibraryModalProps> = ({
                     </button>
 
                     <div className="flex items-center gap-1.5">
+                      {onPlayPreview && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onSelectPreset(preset);
+                            onPlayPreview(preset);
+                          }}
+                          className="p-1 rounded-[2px] bg-[#182a1e] hover:bg-[#203a2a] border border-[#59cbd0]/60 text-[#59cbd0] transition-colors"
+                          title="Probar sonido de este preset"
+                        >
+                          <Volume2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+
                       {isUser && (
                         <button
                           type="button"

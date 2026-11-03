@@ -111,10 +111,37 @@ export default function App() {
     audioEngine.setParam(key, val);
   };
 
+  // --- AUDIO PREVIEW TRANSLATION TRIGGER ---
+  const playPresetPreview = useCallback(async (customPreset?: ResonatorPresetJson) => {
+    // 1. Ensure Audio Context is initialized and active
+    const success = await audioEngine.initAudio();
+    if (success) {
+      setIsAudioRunning(true);
+      audioEngine.setupMidi((status) => setMidiStatus(status));
+    }
+
+    // 2. Calculate preview pitch based on patch octave
+    const oct = customPreset ? customPreset.osc.octave : params.octave;
+    const rootNote = Math.max(36, Math.min(84, 60 + (oct || 0) * 12));
+
+    // 3. Play a rich 2-stage melodic chord phrase (Root -> Fifth)
+    audioEngine.triggerAttack(rootNote, 0.85);
+
+    const t1 = setTimeout(() => {
+      audioEngine.triggerAttack(rootNote + 7, 0.75);
+    }, 180);
+
+    const t2 = setTimeout(() => {
+      audioEngine.triggerRelease(rootNote);
+      audioEngine.triggerRelease(rootNote + 7);
+    }, 620);
+  }, [params.octave]);
+
   // --- PRESET MANAGEMENT HANDLERS ---
   const handleSelectPreset = (preset: ResonatorPresetJson) => {
     setActivePresetName(preset.name);
     applyPreset(preset, setParams, setVisuals, setCables);
+    playPresetPreview(preset);
   };
 
   const handleSavePreset = (name: string, author: string) => {
@@ -139,14 +166,16 @@ export default function App() {
     setPresetList(updated);
     setActivePresetName(imported.name);
     applyPreset(imported, setParams, setVisuals, setCables);
+    playPresetPreview(imported);
   };
 
-  const handlePresetGenerated = (generated: ResonatorPresetJson) => {
+  const handlePresetGenerated = async (generated: ResonatorPresetJson) => {
     savePresetToLocalStorage(generated);
     const updated = loadPresetList();
     setPresetList(updated);
     setActivePresetName(generated.name);
     applyPreset(generated, setParams, setVisuals, setCables);
+    await playPresetPreview(generated);
   };
 
   // Waveform options
@@ -201,6 +230,7 @@ export default function App() {
         onDeletePreset={handleDeletePreset}
         onImportPreset={handleImportPreset}
         onOpenLibrary={() => setIsLibraryOpen(true)}
+        onPlayPreview={() => playPresetPreview()}
         activeAuthor="TOMAS.WAV"
       />
 
@@ -225,6 +255,8 @@ export default function App() {
             const name = prompt('Nombre para este preset:', `${activePresetName} (Neuronal)`);
             if (name) handleSavePreset(name, 'TOMAS.WAV');
           }}
+          onPlayPreview={() => playPresetPreview()}
+          onEngageAudio={handleEngageAudio}
           currentPresetName={activePresetName}
           currentAuthor={presetList.find(p => p.name === activePresetName)?.author || 'TOMAS.WAV'}
           currentWave={params.waveform}
@@ -615,6 +647,7 @@ export default function App() {
         activePresetName={activePresetName}
         onSelectPreset={handleSelectPreset}
         onDeletePreset={handleDeletePreset}
+        onPlayPreview={(preset) => playPresetPreview(preset)}
         onImportPreset={(rawJson) => {
           try {
             const parsed = parseAndValidatePresetJson(rawJson);
