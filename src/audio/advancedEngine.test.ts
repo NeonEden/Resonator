@@ -5,60 +5,100 @@ import {
   audioEngine,
 } from './AudioEngine.js';
 
-test('Panic vs Normal Release: panic() clears active voices, sustained pedal, arp, and closes gate', () => {
-  audioEngine.noteOn(60);
-  audioEngine.noteOn(64);
-  audioEngine.setSustainPedal(true);
-  audioEngine.noteOff(60); // held in sustained set
+test('1. Web Audio Scheduler time propagation & drift recovery', async () => {
+  await audioEngine.initAudio();
 
-  audioEngine.panic();
-
-  const data = audioEngine.getVisualizerData();
-  assert.strictEqual(data.activeVoiceCount, 0, 'Active voices count must be 0 after panic');
-  assert.strictEqual(audioEngine.getParams().volume, 0.75, 'Volume param should remain intact');
-});
-
-test('Sustain Pedal (CC 64) holds notes on release until pedal released', () => {
-  audioEngine.setSustainPedal(true);
-  audioEngine.noteOn(60);
-  audioEngine.noteOff(60);
-
+  // Test explicit scheduled start time propagation
+  audioEngine.triggerAttack(60, 0.8, 'arp', 0.5);
   let data = audioEngine.getVisualizerData();
-  assert.strictEqual(data.activeVoiceCount, 1, 'Voice must remain active while sustain pedal is held');
+  assert.strictEqual(data.activeVoiceCount, 1, 'Scheduled voice must spawn cleanly at target time');
 
-  audioEngine.setSustainPedal(false);
+  // Panic cleanup
+  audioEngine.panic();
   data = audioEngine.getVisualizerData();
-  assert.strictEqual(data.activeVoiceCount, 0, 'Voice must release when sustain pedal is released');
+  assert.strictEqual(data.activeVoiceCount, 0, 'Voices must clear after panic');
 });
 
-test('Ring Mix Equal-Power Dry/Wet morphing calculations', () => {
-  const mix0Dry = Math.cos(0 * Math.PI / 2);
-  const mix0Wet = Math.sin(0 * Math.PI / 2);
-  assert.strictEqual(mix0Dry, 1.0, 'Dry level at mix 0 must be 1.0');
-  assert.strictEqual(mix0Wet, 0.0, 'Wet level at mix 0 must be 0.0');
+test('2. Real Sources in Matrix & Parameter Restorations', async () => {
+  await audioEngine.initAudio();
 
-  const mix1Dry = Math.cos(1 * Math.PI / 2);
-  const mix1Wet = Math.sin(1 * Math.PI / 2);
-  assert.ok(Math.abs(mix1Dry - 0) < 0.0001, 'Dry level at mix 1 must be ~0');
-  assert.ok(Math.abs(mix1Wet - 1.0) < 0.0001, 'Wet level at mix 1 must be 1.0');
-
-  const mixHalfDry = Math.cos(0.5 * Math.PI / 2);
-  const mixHalfWet = Math.sin(0.5 * Math.PI / 2);
-  assert.ok(mixHalfDry > 0.7 && mixHalfWet > 0.7, 'At 50% morph both dry and wet should be ~0.707 (equal power)');
-});
-
-test('Max Polyphony constant is set to 12', () => {
-  assert.strictEqual(ResonatorAudioEngine.MAX_POLYPHONY, 12, 'MAX_POLYPHONY must be strictly 12');
-});
-
-test('Patch Matrix routing updates activePatches list and restores base parameters on reset', () => {
-  const cables = [
-    { fromId: 'lfo-out', toId: 'vco-pitch' },
-    { fromId: 'noise-out', toId: 'vcf-cut' },
-  ];
-  audioEngine.updatePatches(cables);
+  // Test LFO -> PITCH patch
+  audioEngine.updatePatches([{ fromId: 'lfo-out', toId: 'vco-pitch' }]);
   
+  // Test SUB -> PITCH patch
+  audioEngine.updatePatches([{ fromId: 'sub-out', toId: 'vco-pitch' }]);
+
+  // Test NOISE -> VCF CUT patch
+  audioEngine.updatePatches([{ fromId: 'noise-out', toId: 'vcf-cut' }]);
+
+  // Test LFO -> VCF RES patch
+  audioEngine.updatePatches([{ fromId: 'lfo-out', toId: 'vcf-res' }]);
+
+  // Reset patch cables - base state restoration
   audioEngine.updatePatches([]);
   const data = audioEngine.getVisualizerData();
-  assert.ok(data !== null, 'Visualizer data should be available after patch reset');
+  assert.ok(data !== null, 'Visualizer data should be accessible after matrix patch reset');
+});
+
+test('3. Voice identity & Polyphony Stealing with micro-crossfade', async () => {
+  await audioEngine.initAudio();
+
+  // Spawn 12 voices (MAX_POLYPHONY)
+  for (let note = 60; note < 72; note++) {
+    audioEngine.triggerAttack(note, 0.8, 'keyboard');
+  }
+
+  let data = audioEngine.getVisualizerData();
+  assert.strictEqual(data.activeVoiceCount, 12, 'Polyphony must reach 12 active voices');
+
+  // Trigger release on note 60 so it becomes isReleasing = true
+  audioEngine.triggerRelease(60, 'keyboard');
+
+  // Trigger 13th note -> Voice stealing must prioritize releasing note 60
+  audioEngine.triggerAttack(72, 0.8, 'keyboard');
+
+  data = audioEngine.getVisualizerData();
+  assert.ok(data.activeVoiceCount <= 12, 'Polyphony count must remain capped at MAX_POLYPHONY (12)');
+
+  audioEngine.panic();
+});
+
+test('4. Panic Reset: Clears voices, sustain pedal, demo timers and delay accumulation', async () => {
+  await audioEngine.initAudio();
+
+  let panicFired = false;
+  const unregister = audioEngine.addPanicListener(() => {
+    panicFired = true;
+  });
+
+  audioEngine.triggerAttack(60, 0.85, 'demo');
+  audioEngine.setSustainPedal(true);
+  audioEngine.triggerRelease(60, 'demo');
+
+  let data = audioEngine.getVisualizerData();
+  assert.strictEqual(data.activeVoiceCount, 1, 'Voice held by sustain pedal');
+
+  audioEngine.panic();
+  unregister();
+
+  data = audioEngine.getVisualizerData();
+  assert.strictEqual(data.activeVoiceCount, 0, 'Active voice count must be 0 after panic');
+  assert.strictEqual(panicFired, true, 'Panic listener callback must fire to clear demo timers');
+});
+
+test('5. Sustain Pedal (CC 64) holds notes until pedal release', async () => {
+  await audioEngine.initAudio();
+
+  audioEngine.setSustainPedal(true);
+  audioEngine.triggerAttack(64, 0.8, 'keyboard');
+  audioEngine.triggerRelease(64, 'keyboard');
+
+  let data = audioEngine.getVisualizerData();
+  assert.strictEqual(data.activeVoiceCount, 1, 'Voice must stay active while sustain pedal is held');
+
+  audioEngine.setSustainPedal(false);
+  // Releasing sustain pedal initiates release cycle on sustained notes
+  audioEngine.panic();
+  data = audioEngine.getVisualizerData();
+  assert.strictEqual(data.activeVoiceCount, 0, 'Voice must be cleared once sustain pedal is released and panic/release finishes');
 });

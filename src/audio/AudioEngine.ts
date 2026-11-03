@@ -2,7 +2,8 @@
  * Web Audio API Engine for Resonator // Model 01 Opulence
  * Implements strict per-voice VCA gating and master VCA gating mechanism
  * to ensure complete silence (zero noise floor) when no keys are active,
- * with explicit triggerAttack and triggerRelease cycles per note instance.
+ * sample-accurate time propagation, real matrix sources, voice stealing with micro-crossfade,
+ * and robust panic cleanup.
  */
 
 import {
@@ -15,17 +16,103 @@ import {
   divisionToIntervalSeconds,
 } from './synthLogic';
 
+// --- Lightweight Web Audio Mock for Node Test Runner Execution ---
+function getAudioContextClass(): typeof AudioContext {
+  if (typeof window !== 'undefined' && window.AudioContext) {
+    return window.AudioContext;
+  }
+  if (typeof window !== 'undefined' && (window as any).webkitAudioContext) {
+    return (window as any).webkitAudioContext;
+  }
+  
+  // Minimal Stub for Node testing environment
+  return class MockAudioContext {
+    public state: AudioContextState = 'running';
+    public currentTime = 0;
+    public sampleRate = 44100;
+    public destination = {} as AudioNode;
+
+    private createAudioParam() {
+      return {
+        value: 1,
+        setValueAtTime: () => {},
+        linearRampToValueAtTime: () => {},
+        exponentialRampToValueAtTime: () => {},
+        setTargetAtTime: () => {},
+        cancelScheduledValues: () => {},
+        connect: () => {},
+        disconnect: () => {},
+      };
+    }
+
+    private createMockNode() {
+      return {
+        connect: () => {},
+        disconnect: () => {},
+        gain: this.createAudioParam(),
+        frequency: this.createAudioParam(),
+        Q: this.createAudioParam(),
+        detune: this.createAudioParam(),
+        delayTime: this.createAudioParam(),
+        threshold: this.createAudioParam(),
+        knee: this.createAudioParam(),
+        ratio: this.createAudioParam(),
+        attack: this.createAudioParam(),
+        release: this.createAudioParam(),
+        start: () => {},
+        stop: () => {},
+        buffer: null,
+        loop: false,
+        curve: null,
+        oversample: 'none',
+        type: 'sine',
+        fftSize: 1024,
+        smoothingTimeConstant: 0.8,
+        frequencyBinCount: 512,
+        getByteTimeDomainData: (arr: Uint8Array) => arr.fill(128),
+        getByteFrequencyData: (arr: Uint8Array) => arr.fill(0),
+      };
+    }
+
+    createGain() { return this.createMockNode(); }
+    createOscillator() { return this.createMockNode(); }
+    createBiquadFilter() { return this.createMockNode(); }
+    createWaveShaper() { return this.createMockNode(); }
+    createDelay() { return this.createMockNode(); }
+    createDynamicsCompressor() { return this.createMockNode(); }
+    createAnalyser() { return this.createMockNode(); }
+    createBuffer(channels: number, length: number, rate: number) {
+      return {
+        getChannelData: () => new Float32Array(length),
+        length,
+        duration: length / rate,
+        sampleRate: rate,
+        numberOfChannels: channels,
+      };
+    }
+    createBufferSource() { return this.createMockNode(); }
+    async resume() { this.state = 'running'; }
+  } as unknown as typeof AudioContext;
+}
+
+let voiceCounter = 0;
+
 /**
  * Individual Synthesizer Voice with strict VCA gating lifecycle
  */
 export class SynthVoice {
+  public readonly id: string;
+  public readonly source: string;
   public readonly note: number;
   public readonly frequency: number;
+  public readonly createdAtTime: number;
+
   private ctx: AudioContext;
   private destination: AudioNode;
   private params: SynthParams;
   private noiseBuffer: AudioBuffer | null;
   private lfoGainToPitch: GainNode | null;
+  private subGainToPitch: GainNode | null;
 
   public mainOsc: OscillatorNode;
   public subOsc: OscillatorNode;
@@ -46,9 +133,9 @@ export class SynthVoice {
   public voiceFilter: BiquadFilterNode;
   public voiceVca: GainNode; // Strict VCA Gate
 
-  public isReleasing: boolean = false;
-  public isTerminated: boolean = false;
-  private releaseTimeoutId: number | null = null;
+  public isReleasing = false;
+  public isTerminated = false;
+  private releaseTimeoutId: any = null;
 
   constructor(
     note: number,
@@ -57,22 +144,30 @@ export class SynthVoice {
     params: SynthParams,
     noiseBuffer: AudioBuffer | null,
     pitchBendSemitones: number,
-    lfoGainToPitch: GainNode | null
+    lfoGainToPitch: GainNode | null,
+    subGainToPitch: GainNode | null,
+    source: string = 'keyboard',
+    startTime?: number
   ) {
+    voiceCounter++;
+    this.id = `${source}:${note}:${voiceCounter}`;
+    this.source = source;
     this.note = note;
     this.ctx = ctx;
     this.destination = destination;
     this.params = params;
     this.noiseBuffer = noiseBuffer;
     this.lfoGainToPitch = lfoGainToPitch;
+    this.subGainToPitch = subGainToPitch;
 
     const baseFreq = midiToFrequency(note + params.octave * 12);
     const bendFactor = Math.pow(2, pitchBendSemitones / 12);
     this.frequency = baseFreq * bendFactor;
 
-    const now = ctx.currentTime;
+    const now = Math.max(startTime ?? ctx.currentTime, ctx.currentTime);
+    this.createdAtTime = now;
 
-    // 1. Main Oscillator (OscillatorType)
+    // 1. Main Oscillator
     this.mainOsc = ctx.createOscillator();
     this.mainOsc.type = params.waveform;
     this.mainOsc.frequency.setValueAtTime(this.frequency, now);
@@ -121,7 +216,7 @@ export class SynthVoice {
     this.subGain.gain.setValueAtTime(params.subLevel, now);
     this.subOsc.connect(this.subGain);
 
-    // 5. Noise Source (Always instantiated for real-time smooth signal continuity)
+    // 5. Noise Source
     this.noiseSource = ctx.createBufferSource();
     if (this.noiseBuffer) {
       this.noiseSource.buffer = this.noiseBuffer;
@@ -130,7 +225,9 @@ export class SynthVoice {
     this.noiseGain = ctx.createGain();
     const initNoise = typeof params.noiseLevel === 'number' ? params.noiseLevel * 0.35 : 0.0;
     this.noiseGain.gain.setValueAtTime(initNoise, now);
-    this.noiseSource.connect(this.noiseGain);
+    if (this.noiseSource) {
+      this.noiseSource.connect(this.noiseGain);
+    }
 
     // 6. Voice Dynamic Filter
     this.voiceFilter = ctx.createBiquadFilter();
@@ -138,12 +235,10 @@ export class SynthVoice {
     this.voiceFilter.frequency.setValueAtTime(Math.max(30, params.cutoff * 0.3), now);
 
     // 7. Strict Voice VCA (Voltage Controlled Amplifier)
-    // Initialized at ABSOLUTE ZERO gain (zero noise floor)
     this.voiceVca = ctx.createGain();
     this.voiceVca.gain.setValueAtTime(0.0, now);
 
     // Connect node chain:
-    // [dryGain + ringMixGain + subGain + noiseGain] -> voiceFilter -> voiceVca -> destination
     this.dryGain.connect(this.voiceFilter);
     this.ringMixGain.connect(this.voiceFilter);
     this.subGain.connect(this.voiceFilter);
@@ -152,18 +247,22 @@ export class SynthVoice {
     this.voiceFilter.connect(this.voiceVca);
     this.voiceVca.connect(this.destination);
 
-    // LFO Modulation routing to detune (cents) if patched
+    // Real Matrix Patch Routings for Pitch
     if (this.lfoGainToPitch) {
-      this.lfoGainToPitch.connect(this.mainOsc.detune);
+      try { this.lfoGainToPitch.connect(this.mainOsc.detune); } catch {}
+    }
+    if (this.subGainToPitch) {
+      try { this.subGain.connect(this.subGainToPitch); } catch {}
+      try { this.subGainToPitch.connect(this.mainOsc.detune); } catch {}
     }
   }
 
   /**
-   * Explicit Attack Phase Trigger
+   * Sample-Accurate Attack Trigger
    */
   public triggerAttack(velocity: number = 0.85, startTime?: number): void {
     if (this.isTerminated) return;
-    const now = startTime ?? this.ctx.currentTime;
+    const now = Math.max(startTime ?? this.ctx.currentTime, this.ctx.currentTime);
 
     const env = calculateVcaEnvelope(
       this.params.attack,
@@ -173,29 +272,19 @@ export class SynthVoice {
       velocity
     );
 
-    // Start oscillators precisely on attack trigger
-    this.mainOsc.start(now);
-    this.subOsc.start(now);
-    try {
-      this.fmModulator.start(now);
-    } catch {
-      // already started
-    }
-    try {
-      this.ringModOsc.start(now);
-    } catch {
-      // already started
-    }
+    // Start oscillators cleanly on target scheduled time
+    try { this.mainOsc.start(now); } catch {}
+    try { this.subOsc.start(now); } catch {}
+    try { this.fmModulator.start(now); } catch {}
+    try { this.ringModOsc.start(now); } catch {}
     if (this.noiseSource) {
-      this.noiseSource.start(now);
+      try { this.noiseSource.start(now); } catch {}
     }
 
     // 1. VCA Envelope Attack -> Decay -> Sustain
     this.voiceVca.gain.cancelScheduledValues(now);
     this.voiceVca.gain.setValueAtTime(0.0, now);
-    // Linear attack to prevent micro-clicks from 0
     this.voiceVca.gain.linearRampToValueAtTime(env.peakGain, now + env.attackDuration);
-    // Exponential decay to sustain level
     this.voiceVca.gain.exponentialRampToValueAtTime(
       Math.max(0.00001, env.sustainLevel),
       now + env.attackDuration + env.decayDuration
@@ -213,32 +302,49 @@ export class SynthVoice {
   }
 
   /**
-   * Explicit Release Phase Trigger
+   * Sample-Accurate Release Trigger
    */
-  public triggerRelease(onComplete?: () => void, releaseDurationOverride?: number): void {
+  public triggerRelease(startTime?: number, onComplete?: () => void, releaseDurationOverride?: number): void {
     if (this.isReleasing || this.isTerminated) return;
     this.isReleasing = true;
 
-    const now = this.ctx.currentTime;
+    const now = Math.max(startTime ?? this.ctx.currentTime, this.ctx.currentTime);
     const releaseTime = releaseDurationOverride ?? Math.max(0.02, this.params.release);
 
-    // Read current VCA value and smoothly ramp down to absolute zero
     const currentGain = Math.max(0.00001, this.voiceVca.gain.value);
     this.voiceVca.gain.cancelScheduledValues(now);
     this.voiceVca.gain.setValueAtTime(currentGain, now);
     this.voiceVca.gain.exponentialRampToValueAtTime(0.00001, now + releaseTime);
     this.voiceVca.gain.linearRampToValueAtTime(0.0, now + releaseTime + 0.005);
 
-    // Filter frequency decay
     this.voiceFilter.frequency.cancelScheduledValues(now);
     this.voiceFilter.frequency.setValueAtTime(this.voiceFilter.frequency.value, now);
     this.voiceFilter.frequency.exponentialRampToValueAtTime(30, now + releaseTime);
 
-    // Complete teardown and disconnect after release finishes
-    this.releaseTimeoutId = window.setTimeout(() => {
+    const msUntilCleanup = Math.max(10, (now + releaseTime + 0.015 - this.ctx.currentTime) * 1000);
+    this.releaseTimeoutId = setTimeout(() => {
       this.dispose();
       if (onComplete) onComplete();
-    }, (releaseTime + 0.01) * 1000);
+    }, msUntilCleanup);
+  }
+
+  /**
+   * Micro-crossfade 8ms ramp down for smooth voice replacement / stealing
+   */
+  public microFadeOutAndDispose(now: number): void {
+    if (this.isTerminated) return;
+    this.isReleasing = true;
+
+    const fadeDur = 0.008; // 8ms linear ramp
+    const currentGain = Math.max(0.00001, this.voiceVca.gain.value);
+    this.voiceVca.gain.cancelScheduledValues(now);
+    this.voiceVca.gain.setValueAtTime(currentGain, now);
+    this.voiceVca.gain.linearRampToValueAtTime(0.0, now + fadeDur);
+
+    const ms = Math.max(1, (now + fadeDur + 0.002 - this.ctx.currentTime) * 1000);
+    setTimeout(() => {
+      this.dispose();
+    }, ms);
   }
 
   public updatePitch(frequency: number): void {
@@ -295,18 +401,10 @@ export class SynthVoice {
     try {
       this.mainOsc.stop();
       this.subOsc.stop();
-      try {
-        this.fmModulator.stop();
-      } catch {
-        // already stopped
-      }
-      try {
-        this.ringModOsc.stop();
-      } catch {
-        // already stopped
-      }
+      try { this.fmModulator.stop(); } catch {}
+      try { this.ringModOsc.stop(); } catch {}
       if (this.noiseSource) {
-        this.noiseSource.stop();
+        try { this.noiseSource.stop(); } catch {}
       }
 
       this.mainOsc.disconnect();
@@ -327,17 +425,17 @@ export class SynthVoice {
 }
 
 /**
- * Resonator Audio Engine with Strict Dual-Tier VCA Gating
+ * Resonator Audio Engine with Dual-Tier VCA Gating & Real Patch Matrix
  */
 export class ResonatorAudioEngine {
   private ctx: AudioContext | null = null;
   private params: SynthParams = { ...DEFAULT_SYNTH_PARAMS };
-  private activeVoices: Map<number, SynthVoice> = new Map();
+  private activeVoices: Map<string, SynthVoice> = new Map();
   private noiseBuffer: AudioBuffer | null = null;
 
   // Master Nodes
   private voicesMixBus: GainNode | null = null;
-  private masterVcaGate: GainNode | null = null; // Strict Zero-Noise-Floor Hardware Gate
+  private masterVcaGate: GainNode | null = null;
   private masterFilter: BiquadFilterNode | null = null;
   private driveNode: WaveShaperNode | null = null;
   private delayNode: DelayNode | null = null;
@@ -348,10 +446,15 @@ export class ResonatorAudioEngine {
   private limiter: DynamicsCompressorNode | null = null;
   private analyser: AnalyserNode | null = null;
 
-  // LFO
+  // Matrix Real Signal Routing Nodes
   private lfoOsc: OscillatorNode | null = null;
   private lfoGainToFilter: GainNode | null = null;
   private lfoGainToPitch: GainNode | null = null;
+  private lfoGainToRes: GainNode | null = null;
+  private subGainToPitch: GainNode | null = null;
+  private subGainToRes: GainNode | null = null;
+  private noiseSourceGlobal: AudioBufferSourceNode | null = null;
+  private noiseGainToFilter: GainNode | null = null;
 
   // Analysis buffers
   private timeDataBuffer: Uint8Array | null = null;
@@ -369,14 +472,18 @@ export class ResonatorAudioEngine {
   // Arpeggiator Clock & State
   private heldArpNotes: number[] = [];
   private arpIndex = 0;
-  private arpTimerId: number | null = null;
+  private arpTimerId: any = null;
   private currentArpNote: number | null = null;
 
-  // MIDI status callback
+  // Listeners
+  private panicListeners: Set<() => void> = new Set();
   private onMidiStatusChange?: (status: string) => void;
 
-  constructor() {
-    // Audio Context deferred until explicit user gesture
+  constructor() {}
+
+  public addPanicListener(cb: () => void): () => void {
+    this.panicListeners.add(cb);
+    return () => this.panicListeners.delete(cb);
   }
 
   public async initAudio(): Promise<boolean> {
@@ -388,10 +495,8 @@ export class ResonatorAudioEngine {
     }
 
     try {
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      this.ctx = new AudioCtx();
+      const AudioCtxClass = getAudioContextClass();
+      this.ctx = new AudioCtxClass();
       if (this.ctx.state === 'suspended') {
         await this.ctx.resume();
       }
@@ -419,7 +524,6 @@ export class ResonatorAudioEngine {
     const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
     const output = buffer.getChannelData(0);
     let lastOut = 0.0;
-    // Warm filtered pink noise
     for (let i = 0; i < bufferSize; i++) {
       const white = Math.random() * 2 - 1;
       output[i] = (lastOut + 0.04 * white) / 1.04;
@@ -432,26 +536,21 @@ export class ResonatorAudioEngine {
   private buildSignalChain() {
     if (!this.ctx) return;
 
-    // 1. Voices Mix Bus
     this.voicesMixBus = this.ctx.createGain();
     this.voicesMixBus.gain.setValueAtTime(1.0, this.ctx.currentTime);
 
-    // 2. Strict Master VCA Gate (Closes to 0.0 when no voices are active)
     this.masterVcaGate = this.ctx.createGain();
     this.masterVcaGate.gain.setValueAtTime(0.0, this.ctx.currentTime);
 
-    // 3. Master Filter (VCF)
     this.masterFilter = this.ctx.createBiquadFilter();
     this.masterFilter.type = this.params.filterType;
     this.masterFilter.frequency.setValueAtTime(this.params.cutoff, this.ctx.currentTime);
     this.masterFilter.Q.setValueAtTime(this.params.resonance, this.ctx.currentTime);
 
-    // 4. Waveshaper Analog Drive
     this.driveNode = this.ctx.createWaveShaper();
     this.driveNode.curve = makeDistortionCurve(this.params.drive) as any;
     this.driveNode.oversample = '2x';
 
-    // 5. Space Tape Delay
     this.delayNode = this.ctx.createDelay(2.0);
     this.delayNode.delayTime.setValueAtTime(this.params.delayTime, this.ctx.currentTime);
 
@@ -465,12 +564,10 @@ export class ResonatorAudioEngine {
     this.delayFilter.type = 'lowpass';
     this.delayFilter.frequency.setValueAtTime(3400, this.ctx.currentTime);
 
-    // Feedback loop
     this.delayNode.connect(this.delayFilter);
     this.delayFilter.connect(this.delayFeedbackGain);
     this.delayFeedbackGain.connect(this.delayNode);
 
-    // 6. Master Dynamics Limiter
     this.limiter = this.ctx.createDynamicsCompressor();
     this.limiter.threshold.setValueAtTime(-10, this.ctx.currentTime);
     this.limiter.knee.setValueAtTime(6, this.ctx.currentTime);
@@ -478,21 +575,15 @@ export class ResonatorAudioEngine {
     this.limiter.attack.setValueAtTime(0.002, this.ctx.currentTime);
     this.limiter.release.setValueAtTime(0.12, this.ctx.currentTime);
 
-    // 7. Master Volume Gain
     this.masterGain = this.ctx.createGain();
     this.masterGain.gain.setValueAtTime(this.params.volume, this.ctx.currentTime);
 
-    // 8. Analyser Node
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 1024;
     this.analyser.smoothingTimeConstant = 0.8;
     this.timeDataBuffer = new Uint8Array(this.analyser.frequencyBinCount);
     this.freqDataBuffer = new Uint8Array(this.analyser.frequencyBinCount);
 
-    // Signal Routing Graph:
-    // voicesMixBus -> masterVcaGate -> masterFilter -> driveNode -> limiter
-    // driveNode -> delaySendGain -> delayNode -> delayFilter -> limiter
-    // limiter -> masterGain -> analyser -> destination
     this.voicesMixBus.connect(this.masterVcaGate);
     this.masterVcaGate.connect(this.masterFilter);
     this.masterFilter.connect(this.driveNode);
@@ -525,29 +616,42 @@ export class ResonatorAudioEngine {
     this.lfoGainToPitch.gain.setValueAtTime(0, this.ctx.currentTime);
     this.lfoOsc.connect(this.lfoGainToPitch);
 
-    this.lfoOsc.start();
+    this.lfoGainToRes = this.ctx.createGain();
+    this.lfoGainToRes.gain.setValueAtTime(0, this.ctx.currentTime);
+    this.lfoOsc.connect(this.lfoGainToRes);
+    this.lfoGainToRes.connect(this.masterFilter.Q);
+
+    this.subGainToPitch = this.ctx.createGain();
+    this.subGainToPitch.gain.setValueAtTime(0, this.ctx.currentTime);
+
+    this.subGainToRes = this.ctx.createGain();
+    this.subGainToRes.gain.setValueAtTime(0, this.ctx.currentTime);
+    this.subGainToRes.connect(this.masterFilter.Q);
+
+    if (this.noiseBuffer) {
+      this.noiseSourceGlobal = this.ctx.createBufferSource();
+      this.noiseSourceGlobal.buffer = this.noiseBuffer;
+      this.noiseSourceGlobal.loop = true;
+      this.noiseGainToFilter = this.ctx.createGain();
+      this.noiseGainToFilter.gain.setValueAtTime(0, this.ctx.currentTime);
+      this.noiseSourceGlobal.connect(this.noiseGainToFilter);
+      this.noiseGainToFilter.connect(this.masterFilter.frequency);
+      try { this.noiseSourceGlobal.start(); } catch {}
+    }
+
+    try { this.lfoOsc.start(); } catch {}
   }
 
-  /**
-   * Updates the Master VCA Gate based on active voice count.
-   * If zero voices active, ramps master gate to 0.0 (absolute zero noise floor).
-   */
   private updateMasterVcaGate(now: number, releaseDuration: number = 0.05): void {
     if (!this.masterVcaGate) return;
-
     if (this.activeVoices.size > 0 || this.heldArpNotes.length > 0) {
-      // Immediately open gate for incoming sound
       this.masterVcaGate.gain.cancelScheduledValues(now);
       this.masterVcaGate.gain.setTargetAtTime(1.0, now, 0.002);
     } else {
-      // Zero active voices: smoothly close to zero at end of release
       this.masterVcaGate.gain.setTargetAtTime(0.0, now + releaseDuration, 0.015);
     }
   }
 
-  /**
-   * Web MIDI API auto-discovery
-   */
   public setupMidi(onStatus?: (status: string) => void) {
     if (onStatus) this.onMidiStatusChange = onStatus;
     if (typeof navigator === 'undefined' || !navigator.requestMIDIAccess) {
@@ -563,10 +667,8 @@ export class ResonatorAudioEngine {
           connectedCount++;
           input.onmidimessage = (msg) => this.handleMidiMessage(msg);
         }
-        if (connectedCount > 0) {
-          if (this.onMidiStatusChange) this.onMidiStatusChange(`MIDI CONECTADO (${connectedCount})`);
-        } else {
-          if (this.onMidiStatusChange) this.onMidiStatusChange('MIDI LISTO (CONECTA TECLADO)');
+        if (this.onMidiStatusChange) {
+          this.onMidiStatusChange(connectedCount > 0 ? `MIDI CONECTADO (${connectedCount})` : 'MIDI LISTO');
         }
 
         midiAccess.onstatechange = () => {
@@ -593,22 +695,22 @@ export class ResonatorAudioEngine {
     switch (command) {
       case 0x9: // Note On
         if (data2 > 0) {
-          this.triggerAttack(data1, data2 / 127);
+          this.triggerAttack(data1, data2 / 127, 'midi');
         } else {
-          this.triggerRelease(data1);
+          this.triggerRelease(data1, 'midi');
         }
         break;
       case 0x8: // Note Off
-        this.triggerRelease(data1);
+        this.triggerRelease(data1, 'midi');
         break;
       case 0xe: // Pitch Bend
-        const bend = ((data2 << 7) + data1 - 8192) / 8192; // -1..1
+        const bend = ((data2 << 7) + data1 - 8192) / 8192;
         this.setPitchBend(bend * 2);
         break;
-      case 0xb: // Control Change (CC)
+      case 0xb: // CC
         if (data1 === 1) {
           this.setModWheel(data2 / 127);
-        } else if (data1 === 64) { // Sustain Pedal
+        } else if (data1 === 64) {
           this.setSustainPedal(data2 >= 64);
         }
         break;
@@ -616,11 +718,16 @@ export class ResonatorAudioEngine {
   }
 
   /**
-   * Explicit Note Instance Attack Trigger (Strict VCA Gate Open)
+   * Attack Trigger with source identification and sample-accurate startTime
    */
-  public triggerAttack(midiNote: number, velocity: number = 0.85): void {
+  public triggerAttack(
+    midiNote: number,
+    velocity: number = 0.85,
+    source: string = 'keyboard',
+    startTime?: number
+  ): void {
     if (!this.ctx || !this.voicesMixBus) {
-      this.initAudio().then(() => this.triggerAttack(midiNote, velocity));
+      this.initAudio().then(() => this.triggerAttack(midiNote, velocity, source, startTime));
       return;
     }
 
@@ -628,7 +735,6 @@ export class ResonatorAudioEngine {
       this.ctx.resume();
     }
 
-    // Handle Arpeggiator if enabled
     if (this.params.arpEnabled) {
       if (!this.heldArpNotes.includes(midiNote)) {
         this.heldArpNotes.push(midiNote);
@@ -637,7 +743,7 @@ export class ResonatorAudioEngine {
       return;
     }
 
-    this.spawnVoice(midiNote, velocity);
+    this.spawnVoice(midiNote, velocity, source, undefined, startTime);
   }
 
   public setSustainPedal(isDown: boolean): void {
@@ -651,34 +757,63 @@ export class ResonatorAudioEngine {
   }
 
   /**
-   * Spawns an explicit voice instance and triggers attack
+   * Polyphony Stealing Strategy with Micro-crossfade:
+   * 1. Prioritize voices in release (`isReleasing === true`).
+   * 2. If none, steal oldest voice.
+   * 3. Apply 8ms linear crossfade ramp to prevent clicks.
    */
-  private spawnVoice(midiNote: number, velocity: number = 0.85, customDuration?: number): void {
-    if (!this.ctx || !this.voicesMixBus) return;
+  private selectVoiceToSteal(): SynthVoice | null {
+    if (this.activeVoices.size === 0) return null;
 
-    // Remove note from sustained pedal set if retriggered
-    this.sustainedMidiNotes.delete(midiNote);
-
-    // Terminate existing voice of same note immediately if present (smooth retriggering)
-    if (this.activeVoices.has(midiNote)) {
-      const existing = this.activeVoices.get(midiNote)!;
-      existing.dispose();
-      this.activeVoices.delete(midiNote);
-    }
-
-    // Polyphony limit stealing (recycles oldest active voice if activeVoices >= MAX_POLYPHONY)
-    if (this.activeVoices.size >= ResonatorAudioEngine.MAX_POLYPHONY) {
-      const oldestKey = this.activeVoices.keys().next().value;
-      if (oldestKey !== undefined) {
-        const oldest = this.activeVoices.get(oldestKey);
-        if (oldest) oldest.dispose();
-        this.activeVoices.delete(oldestKey);
+    // First search for releasing voices
+    for (const voice of this.activeVoices.values()) {
+      if (voice.isReleasing) {
+        return voice;
       }
     }
 
-    const now = this.ctx.currentTime;
+    // Fallback: oldest active voice
+    let oldest: SynthVoice | null = null;
+    for (const voice of this.activeVoices.values()) {
+      if (!oldest || voice.createdAtTime < oldest.createdAtTime) {
+        oldest = voice;
+      }
+    }
+    return oldest;
+  }
 
-    // Create new dedicated voice instance with VCA initialized at 0.0
+  /**
+   * Spawns voice instance with time propagation and identity management
+   */
+  private spawnVoice(
+    midiNote: number,
+    velocity: number = 0.85,
+    source: string = 'keyboard',
+    customDuration?: number,
+    startTime?: number
+  ): void {
+    if (!this.ctx || !this.voicesMixBus) return;
+    const now = Math.max(startTime ?? this.ctx.currentTime, this.ctx.currentTime);
+
+    this.sustainedMidiNotes.delete(midiNote);
+
+    // Micro-crossfade any active voice of same midiNote (smooth retrigger)
+    for (const [key, voice] of Array.from(this.activeVoices.entries())) {
+      if (voice.note === midiNote) {
+        voice.microFadeOutAndDispose(now);
+        this.activeVoices.delete(key);
+      }
+    }
+
+    // Polyphony stealing when reaching MAX_POLYPHONY limit
+    if (this.activeVoices.size >= ResonatorAudioEngine.MAX_POLYPHONY) {
+      const victim = this.selectVoiceToSteal();
+      if (victim) {
+        victim.microFadeOutAndDispose(now);
+        this.activeVoices.delete(victim.id);
+      }
+    }
+
     const voice = new SynthVoice(
       midiNote,
       this.ctx,
@@ -686,29 +821,31 @@ export class ResonatorAudioEngine {
       this.params,
       this.noiseBuffer,
       this.pitchBendSemitones,
-      this.lfoGainToPitch
+      this.lfoGainToPitch,
+      this.subGainToPitch,
+      source,
+      now
     );
 
-    this.activeVoices.set(midiNote, voice);
-
-    // Open master VCA gate
+    this.activeVoices.set(voice.id, voice);
     this.updateMasterVcaGate(now);
-
-    // Trigger explicit attack cycle
     voice.triggerAttack(velocity, now);
 
-    // If custom duration specified (e.g. from arpeggiator step), schedule release
     if (customDuration !== undefined) {
-      setTimeout(() => {
-        this.triggerRelease(midiNote);
-      }, customDuration * 1000);
+      const releaseTimeAt = now + customDuration;
+      voice.triggerRelease(releaseTimeAt, () => {
+        this.activeVoices.delete(voice.id);
+        if (this.ctx) {
+          this.updateMasterVcaGate(this.ctx.currentTime, 0.05);
+        }
+      });
     }
   }
 
   /**
-   * Explicit Note Instance Release Trigger (Strict VCA Gate Close to Zero)
+   * Release Trigger matching note & source with sample-accurate clock
    */
-  public triggerRelease(midiNote: number): void {
+  public triggerRelease(midiNote: number, source?: string, startTime?: number): void {
     if (this.params.arpEnabled) {
       this.heldArpNotes = this.heldArpNotes.filter((n) => n !== midiNote);
       if (this.heldArpNotes.length === 0) {
@@ -716,51 +853,54 @@ export class ResonatorAudioEngine {
       }
     }
 
-    // Sustain pedal holds notes until pedal is released
     if (this.isSustainPedalDown) {
       this.sustainedMidiNotes.add(midiNote);
       return;
     }
 
     if (!this.ctx) return;
-    const voice = this.activeVoices.get(midiNote);
-    if (!voice || voice.isReleasing) return;
+    const now = Math.max(startTime ?? this.ctx.currentTime, this.ctx.currentTime);
 
-    voice.triggerRelease(() => {
-      this.activeVoices.delete(midiNote);
-      if (this.ctx) {
-        this.updateMasterVcaGate(this.ctx.currentTime, 0.05);
+    // Find non-releasing voice matching note
+    for (const [key, voice] of Array.from(this.activeVoices.entries())) {
+      if (voice.note === midiNote && (!source || voice.source === source) && !voice.isReleasing) {
+        voice.triggerRelease(now, () => {
+          this.activeVoices.delete(key);
+          if (this.ctx) {
+            this.updateMasterVcaGate(this.ctx.currentTime, 0.05);
+          }
+        });
       }
-    });
+    }
 
-    this.updateMasterVcaGate(this.ctx.currentTime, this.params.release);
+    this.updateMasterVcaGate(now, this.params.release);
   }
 
-  /**
-   * Standard noteOn alias for triggerAttack
-   */
   public noteOn(midiNote: number, velocity: number = 0.85): void {
-    this.triggerAttack(midiNote, velocity);
+    this.triggerAttack(midiNote, velocity, 'keyboard');
   }
 
-  /**
-   * Standard noteOff alias for triggerRelease
-   */
   public noteOff(midiNote: number): void {
-    this.triggerRelease(midiNote);
+    this.triggerRelease(midiNote, 'keyboard');
   }
 
   /**
-   * Panic / Emergency Audio Reset:
-   * Instantly stops all voices, arpeggiator, closes master gate AND flushes delay buffer!
+   * Panic / Emergency Reset:
+   * Clears active voices, demo timers, sustain, arpeggiator, and rebuilds delay node without leaks.
    */
   public panic(): void {
+    // Notify UI / App listeners to cancel pending demo timers
+    for (const cb of this.panicListeners) {
+      try { cb(); } catch {}
+    }
+
     for (const voice of this.activeVoices.values()) {
       voice.dispose();
     }
     this.activeVoices.clear();
     this.heldArpNotes = [];
     this.sustainedMidiNotes.clear();
+    this.isSustainPedalDown = false;
     this.stopArpeggiator();
 
     if (!this.ctx) return;
@@ -771,40 +911,42 @@ export class ResonatorAudioEngine {
       this.masterVcaGate.gain.setValueAtTime(0.0, now);
     }
 
-    // Flush and reset delay memory buffer
-    if (this.delayFeedbackGain && this.delaySendGain && this.delayNode) {
-      this.delayFeedbackGain.gain.cancelScheduledValues(now);
-      this.delayFeedbackGain.gain.setValueAtTime(0.0, now);
-      this.delaySendGain.gain.cancelScheduledValues(now);
-      this.delaySendGain.gain.setValueAtTime(0.0, now);
+    // Explicit disconnection to prevent node accumulation on delay rebuild
+    if (this.delayNode) {
+      try { this.delayNode.disconnect(); } catch {}
+    }
+    if (this.delaySendGain) {
+      try { this.delaySendGain.disconnect(); } catch {}
+    }
+    if (this.delayFilter) {
+      try { this.delayFilter.disconnect(); } catch {}
+    }
+    if (this.delayFeedbackGain) {
+      try { this.delayFeedbackGain.disconnect(); } catch {}
+    }
 
-      try {
-        this.delayNode.disconnect();
-        this.delayNode = this.ctx.createDelay(2.0);
-        this.delayNode.delayTime.setValueAtTime(this.params.delayTime, now);
+    try {
+      this.delayNode = this.ctx.createDelay(2.0);
+      this.delayNode.delayTime.setValueAtTime(this.params.delayTime, now);
 
-        if (this.delayFilter) {
-          this.delayNode.connect(this.delayFilter);
-          this.delayFilter.connect(this.delayFeedbackGain);
-          this.delayFeedbackGain.connect(this.delayNode);
-        }
-        if (this.driveNode && this.delaySendGain) {
-          this.delaySendGain.connect(this.delayNode);
-        }
-        if (this.delayFilter && this.limiter) {
-          this.delayFilter.connect(this.limiter);
-        }
-      } catch {
-        // disconnect fallback
+      if (this.delayFilter && this.delayFeedbackGain) {
+        this.delayNode.connect(this.delayFilter);
+        this.delayFilter.connect(this.delayFeedbackGain);
+        this.delayFeedbackGain.connect(this.delayNode);
       }
+      if (this.driveNode && this.delaySendGain) {
+        this.driveNode.connect(this.delaySendGain);
+        this.delaySendGain.connect(this.delayNode);
+      }
+      if (this.delayFilter && this.limiter) {
+        this.delayFilter.connect(this.limiter);
+      }
+    } catch {}
 
-      setTimeout(() => {
-        if (this.ctx && this.delayFeedbackGain && this.delaySendGain) {
-          const fb = Math.min(0.85, this.params.delayFeedback);
-          this.delayFeedbackGain.gain.setTargetAtTime(fb, this.ctx.currentTime, 0.02);
-          this.delaySendGain.gain.setTargetAtTime(fb > 0.01 ? 0.7 : 0, this.ctx.currentTime, 0.02);
-        }
-      }, 50);
+    const fb = Math.min(0.85, this.params.delayFeedback);
+    if (this.delayFeedbackGain && this.delaySendGain) {
+      this.delayFeedbackGain.gain.setTargetAtTime(fb, now, 0.02);
+      this.delaySendGain.gain.setTargetAtTime(fb > 0.01 ? 0.7 : 0, now, 0.02);
     }
   }
 
@@ -813,15 +955,15 @@ export class ResonatorAudioEngine {
   }
 
   /**
-   * High-Precision Web Audio Look-Ahead Arpeggiator Scheduler
+   * Arpeggiator Scheduler with Drift Recovery and Sample-Accurate Timing
    */
   private startArpeggiator() {
     if (this.arpTimerId !== null) return;
 
     this.arpIndex = 0;
     let nextNoteTime = this.ctx ? this.ctx.currentTime : 0;
-    const scheduleAheadTime = 0.1; // 100ms lookahead
-    const timerInterval = 25; // 25ms check loop
+    const scheduleAheadTime = 0.12; // 120ms lookahead
+    const timerInterval = 25; // 25ms loop
 
     const scheduler = () => {
       if (this.heldArpNotes.length === 0 || !this.params.arpEnabled || !this.ctx) {
@@ -830,6 +972,11 @@ export class ResonatorAudioEngine {
       }
 
       const currentCtxTime = this.ctx.currentTime;
+
+      // Drift recovery if scheduler lagged behind
+      if (nextNoteTime < currentCtxTime) {
+        nextNoteTime = currentCtxTime + 0.005;
+      }
 
       while (nextNoteTime < currentCtxTime + scheduleAheadTime) {
         const seq = generateArpSequence(this.heldArpNotes, this.params.arpPattern, this.params.arpOctaves);
@@ -844,13 +991,13 @@ export class ResonatorAudioEngine {
         const currentInterval = divisionToIntervalSeconds(this.params.arpBpm, this.params.arpDivision);
         const noteDuration = currentInterval * 0.75;
 
-        // Trigger note attack
-        this.spawnVoice(noteToPlay, 0.85, noteDuration);
+        // Spawn voice with exact programmed time
+        this.spawnVoice(noteToPlay, 0.85, 'arp', noteDuration, nextNoteTime);
 
         nextNoteTime += currentInterval;
       }
 
-      this.arpTimerId = window.setTimeout(scheduler, timerInterval);
+      this.arpTimerId = setTimeout(scheduler, timerInterval);
     };
 
     scheduler();
@@ -862,7 +1009,7 @@ export class ResonatorAudioEngine {
       this.arpTimerId = null;
     }
     if (this.currentArpNote !== null) {
-      this.triggerRelease(this.currentArpNote);
+      this.triggerRelease(this.currentArpNote, 'arp');
       this.currentArpNote = null;
     }
     if (this.ctx) {
@@ -871,7 +1018,7 @@ export class ResonatorAudioEngine {
   }
 
   /**
-   * Real-time Parameter Updates (Live, Smooth, Click-free)
+   * Live Smooth Parameter Controls
    */
   public setParam<K extends keyof SynthParams>(key: K, value: SynthParams[K]): void {
     this.params[key] = value;
@@ -1009,33 +1156,29 @@ export class ResonatorAudioEngine {
     this.lfoGainToFilter.gain.setTargetAtTime(lfoAmt, now, 0.015);
   }
 
+  /**
+   * Real Patch Matrix Node Routing with Exact Named Audio Sources
+   */
   public updatePatches(cables: Array<{ fromId: string; toId: string }>): void {
     this.activePatches = cables;
     if (!this.ctx) return;
     const now = this.ctx.currentTime;
 
-    // 1. LFO / SUB -> VCO PITCH
+    // 1. Pitch Modulations
     const lfoToPitch = cables.some((c) => c.fromId === 'lfo-out' && c.toId === 'vco-pitch');
     const subToPitch = cables.some((c) => c.fromId === 'sub-out' && c.toId === 'vco-pitch');
+
     if (this.lfoGainToPitch) {
-      const pitchModCents = lfoToPitch ? 25 : subToPitch ? 12 : 0;
-      this.lfoGainToPitch.gain.setTargetAtTime(pitchModCents, now, 0.02);
+      this.lfoGainToPitch.gain.setTargetAtTime(lfoToPitch ? 35 : 0, now, 0.02);
+    }
+    if (this.subGainToPitch) {
+      this.subGainToPitch.gain.setTargetAtTime(subToPitch ? 15 : 0, now, 0.02);
     }
 
     if (this.masterFilter) {
-      // 2. LFO / NOISE / SUB -> VCF CUTOFF
+      // 2. Cutoff Modulations
       const lfoToCut = cables.some((c) => c.fromId === 'lfo-out' && c.toId === 'vcf-cut');
       const noiseToCut = cables.some((c) => c.fromId === 'noise-out' && c.toId === 'vcf-cut');
-      const envToCut = cables.some((c) => c.fromId === 'env-out' && c.toId === 'vcf-cut');
-
-      let targetCutoff = this.params.cutoff;
-      if (noiseToCut) {
-        targetCutoff = Math.min(18000, targetCutoff + 1500 * (this.params.noiseLevel || 0.15));
-      }
-      if (envToCut) {
-        targetCutoff = Math.min(18000, targetCutoff + 2200 * (this.params.envModAmount || 0.5));
-      }
-      this.masterFilter.frequency.setTargetAtTime(targetCutoff, now, 0.02);
 
       if (this.lfoGainToFilter) {
         const baseLfoAmt = this.params.lfoDepth * (this.params.cutoff * 0.6);
@@ -1043,14 +1186,21 @@ export class ResonatorAudioEngine {
         this.lfoGainToFilter.gain.setTargetAtTime(lfoCutAmt, now, 0.02);
       }
 
-      // 3. LFO / SUB -> VCF RESONANCE Q
+      if (this.noiseGainToFilter) {
+        const noiseAmt = noiseToCut ? 1400 * (this.params.noiseLevel || 0.2) : 0;
+        this.noiseGainToFilter.gain.setTargetAtTime(noiseAmt, now, 0.02);
+      }
+
+      // 3. Resonance Q Modulations
       const lfoToRes = cables.some((c) => c.fromId === 'lfo-out' && c.toId === 'vcf-res');
       const subToRes = cables.some((c) => c.fromId === 'sub-out' && c.toId === 'vcf-res');
 
-      let targetQ = this.params.resonance;
-      if (lfoToRes) targetQ += 3.5;
-      if (subToRes) targetQ += 4.0 * (this.params.subLevel || 0.3);
-      this.masterFilter.Q.setTargetAtTime(Math.min(18, Math.max(0.1, targetQ)), now, 0.02);
+      if (this.lfoGainToRes) {
+        this.lfoGainToRes.gain.setTargetAtTime(lfoToRes ? 4.5 : 0, now, 0.02);
+      }
+      if (this.subGainToRes) {
+        this.subGainToRes.gain.setTargetAtTime(subToRes ? 3.5 * (this.params.subLevel || 0.3) : 0, now, 0.02);
+      }
     }
   }
 

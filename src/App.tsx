@@ -65,6 +65,31 @@ export default function App() {
     },
   ]);
 
+  // Reference to active demo / preview timeout IDs for Panic cancellation
+  const demoTimeoutsRef = React.useRef<any[]>([]);
+
+  const cancelAllDemoTimeouts = useCallback(() => {
+    demoTimeoutsRef.current.forEach(t => clearTimeout(t));
+    demoTimeoutsRef.current = [];
+  }, []);
+
+  // Register panic listener with audio engine
+  useEffect(() => {
+    const unregister = audioEngine.addPanicListener(() => {
+      cancelAllDemoTimeouts();
+      setActiveNotes(new Set());
+    });
+    return () => {
+      unregister();
+    };
+  }, [cancelAllDemoTimeouts]);
+
+  const handlePanic = useCallback(() => {
+    cancelAllDemoTimeouts();
+    setActiveNotes(new Set());
+    audioEngine.panic();
+  }, [cancelAllDemoTimeouts]);
+
   // Initial load: Apply default preset
   useEffect(() => {
     const defaultP = presetList.find(p => p.name === 'Plasma Ion 01') || presetList[0];
@@ -113,6 +138,8 @@ export default function App() {
 
   // --- AUDIO PREVIEW TRANSLATION TRIGGER ---
   const playPresetPreview = useCallback(async (customPreset?: ResonatorPresetJson) => {
+    cancelAllDemoTimeouts();
+
     // 1. Ensure Audio Context is initialized and active
     const success = await audioEngine.initAudio();
     if (success) {
@@ -125,17 +152,19 @@ export default function App() {
     const rootNote = Math.max(36, Math.min(84, 60 + (oct || 0) * 12));
 
     // 3. Play a rich 2-stage melodic chord phrase (Root -> Fifth)
-    audioEngine.triggerAttack(rootNote, 0.85);
+    audioEngine.triggerAttack(rootNote, 0.85, 'demo');
 
     const t1 = setTimeout(() => {
-      audioEngine.triggerAttack(rootNote + 7, 0.75);
+      audioEngine.triggerAttack(rootNote + 7, 0.75, 'demo');
     }, 180);
 
     const t2 = setTimeout(() => {
-      audioEngine.triggerRelease(rootNote);
-      audioEngine.triggerRelease(rootNote + 7);
+      audioEngine.triggerRelease(rootNote, 'demo');
+      audioEngine.triggerRelease(rootNote + 7, 'demo');
     }, 620);
-  }, [params.octave]);
+
+    demoTimeoutsRef.current.push(t1, t2);
+  }, [params.octave, cancelAllDemoTimeouts]);
 
   // --- PRESET MANAGEMENT HANDLERS ---
   const handleSelectPreset = (preset: ResonatorPresetJson) => {
@@ -217,6 +246,14 @@ export default function App() {
           >
             <Power className="w-3.5 h-3.5" />
             <span>{isAudioRunning ? 'SISTEMA ACTIVO' : 'ENCENDER'}</span>
+          </button>
+
+          <button
+            onClick={handlePanic}
+            title="Pánico / Cortar todas las notas y silenciar delay"
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-[3px] border border-[#7a221b] bg-[#321210] hover:bg-[#4a1815] text-[#ff6b59] transition-all text-xs font-['JetBrains_Mono'] font-bold shadow-[0_0_8px_rgba(255,107,89,0.2)]"
+          >
+            <span>PÁNICO</span>
           </button>
         </div>
       </header>
