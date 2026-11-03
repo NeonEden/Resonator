@@ -66,9 +66,12 @@ export default function App() {
   ]);
 
   // Reference to active demo / preview timeout IDs for Panic cancellation
-  const demoTimeoutsRef = React.useRef<any[]>([]);
+  const demoTimeoutsRef = React.useRef<ReturnType<typeof setTimeout>[]>([]);
+  const demoGenerationRef = React.useRef(0);
 
   const cancelAllDemoTimeouts = useCallback(() => {
+    demoGenerationRef.current++;
+    audioEngine.releaseSource('demo');
     demoTimeoutsRef.current.forEach(t => clearTimeout(t));
     demoTimeoutsRef.current = [];
   }, []);
@@ -80,6 +83,7 @@ export default function App() {
       setActiveNotes(new Set());
     });
     return () => {
+      cancelAllDemoTimeouts();
       unregister();
     };
   }, [cancelAllDemoTimeouts]);
@@ -89,6 +93,20 @@ export default function App() {
     setActiveNotes(new Set());
     audioEngine.panic();
   }, [cancelAllDemoTimeouts]);
+
+  useEffect(() => {
+    const releaseKeyboard = () => {
+      audioEngine.releaseSource('keyboard');
+      setActiveNotes(new Set());
+    };
+    const onVisibility = () => { if (document.hidden) releaseKeyboard(); };
+    window.addEventListener('blur', releaseKeyboard);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('blur', releaseKeyboard);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, []);
 
   // Initial load: Apply default preset
   useEffect(() => {
@@ -101,6 +119,7 @@ export default function App() {
   // Audio Context unlock handler (clean, silent initialization, zero noise floor)
   const handleEngageAudio = async () => {
     const success = await audioEngine.initAudio();
+    if (!success) return;
     if (success) {
       setIsAudioRunning(true);
       audioEngine.setupMidi((status) => setMidiStatus(status));
@@ -139,17 +158,19 @@ export default function App() {
   // --- AUDIO PREVIEW TRANSLATION TRIGGER ---
   const playPresetPreview = useCallback(async (customPreset?: ResonatorPresetJson) => {
     cancelAllDemoTimeouts();
+    const generation = demoGenerationRef.current;
 
     // 1. Ensure Audio Context is initialized and active
     const success = await audioEngine.initAudio();
+    if (!success || generation !== demoGenerationRef.current) return;
     if (success) {
       setIsAudioRunning(true);
       audioEngine.setupMidi((status) => setMidiStatus(status));
     }
 
     // 2. Calculate preview pitch based on patch octave
-    const oct = customPreset ? customPreset.osc.octave : params.octave;
-    const rootNote = Math.max(36, Math.min(84, 60 + (oct || 0) * 12));
+    // The engine applies the preset octave once.
+    const rootNote = 60;
 
     // 3. Play a rich 2-stage melodic chord phrase (Root -> Fifth)
     audioEngine.triggerAttack(rootNote, 0.85, 'demo');

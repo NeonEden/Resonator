@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { PatchCable } from '../audio/synthLogic';
+import { isSupportedPatch, PATCH_DESTINATIONS } from '../audio/patchRouting';
 
 interface JackDef {
   id: string;
@@ -33,6 +34,7 @@ interface PatchMatrixProps {
 }
 
 export const PatchMatrix: React.FC<PatchMatrixProps> = ({ cables, onCablesChange }) => {
+  const activeCables = cables.filter(isSupportedPatch);
   const [selectedJackId, setSelectedJackId] = useState<string | null>(null);
 
   const handleJackClick = (jack: JackDef) => {
@@ -52,6 +54,10 @@ export const PatchMatrix: React.FC<PatchMatrixProps> = ({ cables, onCablesChange
         const fromId = sourceJack.type === 'out' ? sourceJack.id : targetJack.id;
         const toId = sourceJack.type === 'in' ? sourceJack.id : targetJack.id;
 
+        if (!isSupportedPatch({ fromId, toId })) {
+          setSelectedJackId(null);
+          return;
+        }
         const exists = cables.some(c => c.fromId === fromId && c.toId === toId);
         if (exists) {
           onCablesChange(cables.filter(c => !(c.fromId === fromId && c.toId === toId)));
@@ -122,7 +128,7 @@ export const PatchMatrix: React.FC<PatchMatrixProps> = ({ cables, onCablesChange
             </filter>
           </defs>
 
-          {cables.map((cable, idx) => {
+          {activeCables.map((cable, idx) => {
             const fromJack = MATRIX_JACKS.find(j => j.id === cable.fromId);
             const toJack = MATRIX_JACKS.find(j => j.id === cable.toId);
             if (!fromJack || !toJack) return null;
@@ -201,14 +207,21 @@ export const PatchMatrix: React.FC<PatchMatrixProps> = ({ cables, onCablesChange
         <div className="grid grid-cols-3 grid-rows-3 h-full w-full relative z-20 py-1">
           {MATRIX_JACKS.map((jack) => {
             const isSelected = selectedJackId === jack.id;
-            const hasConnection = cables.some(c => c.fromId === jack.id || c.toId === jack.id);
+            const selected = MATRIX_JACKS.find(item => item.id === selectedJackId);
+            const unavailable = selected && selected.type !== jack.type && !isSupportedPatch({
+              fromId: selected.type === 'out' ? selected.id : jack.id,
+              toId: selected.type === 'in' ? selected.id : jack.id,
+            });
+            const hasConnection = activeCables.some(c => c.fromId === jack.id || c.toId === jack.id);
 
             return (
               <button
                 key={jack.id}
+                disabled={Boolean(unavailable || (jack.type === 'out' && !PATCH_DESTINATIONS[jack.id]))}
+                title={jack.type === 'out' && !PATCH_DESTINATIONS[jack.id] ? 'Fuente pendiente de implementación' : jack.name}
                 data-testid={`jack-${jack.id}`}
                 aria-label={`Jack ${jack.name} (${jack.type === 'out' ? 'Salida' : 'Entrada'})`}
-                className="flex flex-col items-center justify-center cursor-pointer group focus:outline-none"
+                className="flex flex-col items-center justify-center cursor-pointer group disabled:opacity-35 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-1"
                 onClick={() => handleJackClick(jack)}
               >
                 {/* Concentric Multi-Tiered Copper Jack */}
@@ -254,12 +267,12 @@ export const PatchMatrix: React.FC<PatchMatrixProps> = ({ cables, onCablesChange
         <span className="font-['JetBrains_Mono'] text-[8px] text-[#9e8e7c] block truncate">
           {selectedJackId
             ? `PARCHEAR DESDE ${MATRIX_JACKS.find(j => j.id === selectedJackId)?.name} → ELIGE ENTRADA/SALIDA`
-            : cables.length > 0
-            ? `${cables.length} RUTAS ACTIVAS: ${cables.map(c => `${c.fromId.split('-')[0].toUpperCase()}→${c.toId.replace('vcf-', '').replace('vco-', '').toUpperCase()}`).join(', ')}`
+            : activeCables.length > 0
+            ? `${activeCables.length} RUTAS ACTIVAS: ${activeCables.map(c => `${c.fromId.split('-')[0].toUpperCase()}→${c.toId.replace('vcf-', '').replace('vco-', '').toUpperCase()}`).join(', ')}`
             : 'CLIC EN JACKS PARA MODULAR EN TIEMPO REAL'}
         </span>
         <span className="font-['JetBrains_Mono'] text-[7px] text-[#7a6f62] block truncate mt-0.5">
-          [GATE / RND Reservados para Expansión CV Secuenciador]
+          [ENV / GATE / RND pendientes · SUB por voz]
         </span>
       </div>
     </div>

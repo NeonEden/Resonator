@@ -99,9 +99,11 @@ export const Keyboard: React.FC<KeyboardProps> = ({
                 key={key.midiNote}
                 onPointerDown={(e) => {
                   e.preventDefault();
-                  (e.target as HTMLElement).setPointerCapture(e.pointerId);
+                  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
                   onNoteOn(key.midiNote);
                 }}
+                onPointerCancel={() => onNoteOff(key.midiNote)}
+                onLostPointerCapture={() => onNoteOff(key.midiNote)}
                 onPointerUp={(e) => {
                   e.preventDefault();
                   onNoteOff(key.midiNote);
@@ -160,9 +162,11 @@ export const Keyboard: React.FC<KeyboardProps> = ({
                 onPointerDown={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
-                  (e.target as HTMLElement).setPointerCapture(e.pointerId);
+                  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
                   onNoteOn(key.midiNote);
                 }}
+                onPointerCancel={() => onNoteOff(key.midiNote)}
+                onLostPointerCapture={() => onNoteOff(key.midiNote)}
                 onPointerUp={(e) => {
                   e.preventDefault();
                   e.stopPropagation();

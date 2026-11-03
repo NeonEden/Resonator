@@ -15,84 +15,13 @@ import {
   generateArpSequence,
   divisionToIntervalSeconds,
 } from './synthLogic';
+import { isSupportedPatch } from './patchRouting';
 
-// --- Lightweight Web Audio Mock for Node Test Runner Execution ---
 function getAudioContextClass(): typeof AudioContext {
-  if (typeof window !== 'undefined' && window.AudioContext) {
-    return window.AudioContext;
-  }
-  if (typeof window !== 'undefined' && (window as any).webkitAudioContext) {
-    return (window as any).webkitAudioContext;
-  }
-  
-  // Minimal Stub for Node testing environment
-  return class MockAudioContext {
-    public state: AudioContextState = 'running';
-    public currentTime = 0;
-    public sampleRate = 44100;
-    public destination = {} as AudioNode;
-
-    private createAudioParam() {
-      return {
-        value: 1,
-        setValueAtTime: () => {},
-        linearRampToValueAtTime: () => {},
-        exponentialRampToValueAtTime: () => {},
-        setTargetAtTime: () => {},
-        cancelScheduledValues: () => {},
-        connect: () => {},
-        disconnect: () => {},
-      };
-    }
-
-    private createMockNode() {
-      return {
-        connect: () => {},
-        disconnect: () => {},
-        gain: this.createAudioParam(),
-        frequency: this.createAudioParam(),
-        Q: this.createAudioParam(),
-        detune: this.createAudioParam(),
-        delayTime: this.createAudioParam(),
-        threshold: this.createAudioParam(),
-        knee: this.createAudioParam(),
-        ratio: this.createAudioParam(),
-        attack: this.createAudioParam(),
-        release: this.createAudioParam(),
-        start: () => {},
-        stop: () => {},
-        buffer: null,
-        loop: false,
-        curve: null,
-        oversample: 'none',
-        type: 'sine',
-        fftSize: 1024,
-        smoothingTimeConstant: 0.8,
-        frequencyBinCount: 512,
-        getByteTimeDomainData: (arr: Uint8Array) => arr.fill(128),
-        getByteFrequencyData: (arr: Uint8Array) => arr.fill(0),
-      };
-    }
-
-    createGain() { return this.createMockNode(); }
-    createOscillator() { return this.createMockNode(); }
-    createBiquadFilter() { return this.createMockNode(); }
-    createWaveShaper() { return this.createMockNode(); }
-    createDelay() { return this.createMockNode(); }
-    createDynamicsCompressor() { return this.createMockNode(); }
-    createAnalyser() { return this.createMockNode(); }
-    createBuffer(channels: number, length: number, rate: number) {
-      return {
-        getChannelData: () => new Float32Array(length),
-        length,
-        duration: length / rate,
-        sampleRate: rate,
-        numberOfChannels: channels,
-      };
-    }
-    createBufferSource() { return this.createMockNode(); }
-    async resume() { this.state = 'running'; }
-  } as unknown as typeof AudioContext;
+  const audioWindow = globalThis as typeof globalThis & { webkitAudioContext?: typeof AudioContext };
+  const AudioCtx = audioWindow.AudioContext ?? audioWindow.webkitAudioContext;
+  if (!AudioCtx) throw new Error('Este navegador no admite Web Audio.');
+  return AudioCtx;
 }
 
 let voiceCounter = 0;
@@ -112,7 +41,8 @@ export class SynthVoice {
   private params: SynthParams;
   private noiseBuffer: AudioBuffer | null;
   private lfoGainToPitch: GainNode | null;
-  private subGainToPitch: GainNode | null;
+  private subGainToPitch: GainNode;
+  private subGainToRes: GainNode;
 
   public mainOsc: OscillatorNode;
   public subOsc: OscillatorNode;
@@ -133,9 +63,10 @@ export class SynthVoice {
   public voiceFilter: BiquadFilterNode;
   public voiceVca: GainNode; // Strict VCA Gate
 
-  public isReleasing = false;
+  private releaseAt = Infinity;
+  public get isReleasing(): boolean { return this.ctx.currentTime >= this.releaseAt; }
   public isTerminated = false;
-  private releaseTimeoutId: any = null;
+
 
   constructor(
     note: number,
@@ -145,7 +76,7 @@ export class SynthVoice {
     noiseBuffer: AudioBuffer | null,
     pitchBendSemitones: number,
     lfoGainToPitch: GainNode | null,
-    subGainToPitch: GainNode | null,
+
     source: string = 'keyboard',
     startTime?: number
   ) {
@@ -158,7 +89,10 @@ export class SynthVoice {
     this.params = params;
     this.noiseBuffer = noiseBuffer;
     this.lfoGainToPitch = lfoGainToPitch;
-    this.subGainToPitch = subGainToPitch;
+    this.subGainToPitch = ctx.createGain();
+    this.subGainToRes = ctx.createGain();
+    this.subGainToPitch.gain.value = 0;
+    this.subGainToRes.gain.value = 0;
 
     const baseFreq = midiToFrequency(note + params.octave * 12);
     const bendFactor = Math.pow(2, pitchBendSemitones / 12);
@@ -251,10 +185,10 @@ export class SynthVoice {
     if (this.lfoGainToPitch) {
       try { this.lfoGainToPitch.connect(this.mainOsc.detune); } catch {}
     }
-    if (this.subGainToPitch) {
-      try { this.subGain.connect(this.subGainToPitch); } catch {}
-      try { this.subGainToPitch.connect(this.mainOsc.detune); } catch {}
-    }
+    this.subOsc.connect(this.subGainToPitch);
+    this.subGainToPitch.connect(this.mainOsc.detune);
+    this.subOsc.connect(this.subGainToRes);
+    this.subGainToRes.connect(this.voiceFilter.Q);
   }
 
   /**
@@ -305,46 +239,53 @@ export class SynthVoice {
    * Sample-Accurate Release Trigger
    */
   public triggerRelease(startTime?: number, onComplete?: () => void, releaseDurationOverride?: number): void {
-    if (this.isReleasing || this.isTerminated) return;
-    this.isReleasing = true;
+    if (this.isTerminated) return;
 
     const now = Math.max(startTime ?? this.ctx.currentTime, this.ctx.currentTime);
+    if (now >= this.releaseAt) return;
+    this.releaseAt = now;
     const releaseTime = releaseDurationOverride ?? Math.max(0.02, this.params.release);
 
-    const currentGain = Math.max(0.00001, this.voiceVca.gain.value);
-    this.voiceVca.gain.cancelScheduledValues(now);
-    this.voiceVca.gain.setValueAtTime(currentGain, now);
-    this.voiceVca.gain.exponentialRampToValueAtTime(0.00001, now + releaseTime);
-    this.voiceVca.gain.linearRampToValueAtTime(0.0, now + releaseTime + 0.005);
-
-    this.voiceFilter.frequency.cancelScheduledValues(now);
-    this.voiceFilter.frequency.setValueAtTime(this.voiceFilter.frequency.value, now);
+    // Preserve the envelope value at the scheduled release time, including during attack.
+    this.voiceVca.gain.cancelAndHoldAtTime(now);
+    // Linear release supports an exact zero sustain without an exponential discontinuity.
+    this.voiceVca.gain.linearRampToValueAtTime(0.0, now + releaseTime);
+    this.voiceFilter.frequency.cancelAndHoldAtTime(now);
     this.voiceFilter.frequency.exponentialRampToValueAtTime(30, now + releaseTime);
 
-    const msUntilCleanup = Math.max(10, (now + releaseTime + 0.015 - this.ctx.currentTime) * 1000);
-    this.releaseTimeoutId = setTimeout(() => {
-      this.dispose();
-      if (onComplete) onComplete();
-    }, msUntilCleanup);
+    this.finishAt(now + releaseTime + 0.015, onComplete);
   }
 
   /**
    * Micro-crossfade 8ms ramp down for smooth voice replacement / stealing
    */
-  public microFadeOutAndDispose(now: number): void {
+  public microFadeOutAndDispose(now: number, onComplete?: () => void): void {
     if (this.isTerminated) return;
-    this.isReleasing = true;
+    this.releaseAt = now;
 
     const fadeDur = 0.008; // 8ms linear ramp
-    const currentGain = Math.max(0.00001, this.voiceVca.gain.value);
-    this.voiceVca.gain.cancelScheduledValues(now);
-    this.voiceVca.gain.setValueAtTime(currentGain, now);
+    this.voiceVca.gain.cancelAndHoldAtTime(now);
     this.voiceVca.gain.linearRampToValueAtTime(0.0, now + fadeDur);
 
-    const ms = Math.max(1, (now + fadeDur + 0.002 - this.ctx.currentTime) * 1000);
-    setTimeout(() => {
+    this.finishAt(now + fadeDur, onComplete);
+  }
+
+  private finishAt(time: number, onComplete?: () => void): void {
+    // Audio time keeps teardown aligned even when the tab is throttled or audio is suspended.
+    this.mainOsc.onended = () => {
       this.dispose();
-    }, ms);
+      onComplete?.();
+    };
+    this.mainOsc.stop(time);
+    this.subOsc.stop(time);
+    this.fmModulator.stop(time);
+    this.ringModOsc.stop(time);
+    this.noiseSource?.stop(time);
+  }
+
+  public updateSubPatches(pitch: boolean, resonance: boolean): void {
+    this.subGainToPitch.gain.setTargetAtTime(pitch ? 15 : 0, this.ctx.currentTime, 0.02);
+    this.subGainToRes.gain.setTargetAtTime(resonance ? 3.5 : 0, this.ctx.currentTime, 0.02);
   }
 
   public updatePitch(frequency: number): void {
@@ -392,11 +333,8 @@ export class SynthVoice {
   public dispose(): void {
     if (this.isTerminated) return;
     this.isTerminated = true;
+    this.mainOsc.onended = null;
 
-    if (this.releaseTimeoutId !== null) {
-      clearTimeout(this.releaseTimeoutId);
-      this.releaseTimeoutId = null;
-    }
 
     try {
       this.mainOsc.stop();
@@ -407,7 +345,11 @@ export class SynthVoice {
         try { this.noiseSource.stop(); } catch {}
       }
 
+      this.lfoGainToPitch?.disconnect(this.mainOsc.detune);
       this.mainOsc.disconnect();
+      this.dryGain.disconnect();
+      this.subGainToPitch.disconnect();
+      this.subGainToRes.disconnect();
       this.subOsc.disconnect();
       this.subGain.disconnect();
       this.fmModulator.disconnect();
@@ -451,8 +393,7 @@ export class ResonatorAudioEngine {
   private lfoGainToFilter: GainNode | null = null;
   private lfoGainToPitch: GainNode | null = null;
   private lfoGainToRes: GainNode | null = null;
-  private subGainToPitch: GainNode | null = null;
-  private subGainToRes: GainNode | null = null;
+
   private noiseSourceGlobal: AudioBufferSourceNode | null = null;
   private noiseGainToFilter: GainNode | null = null;
 
@@ -465,28 +406,39 @@ export class ResonatorAudioEngine {
   private pitchBendSemitones = 0;
   private modWheelAmount = 0;
   private activePatches: Array<{ fromId: string; toId: string }> = [];
-  private isSustainPedalDown = false;
-  private sustainedMidiNotes: Set<number> = new Set();
+  private sustainSources = new Set<string>();
+  private sustainedVoices = new Set<string>();
+  private fadingVoices = new Set<SynthVoice>();
+  private initialization: Promise<boolean> | null = null;
+  private generation = 0;
+  private pendingAttacks = new Map<string, symbol>();
+  private arpInputs = new Map<string, number>();
   public static readonly MAX_POLYPHONY = 12;
 
   // Arpeggiator Clock & State
   private heldArpNotes: number[] = [];
   private arpIndex = 0;
   private arpTimerId: any = null;
-  private currentArpNote: number | null = null;
 
   // Listeners
   private panicListeners: Set<() => void> = new Set();
   private onMidiStatusChange?: (status: string) => void;
 
-  constructor() {}
+  constructor(private readonly createContext: () => AudioContext = () => new (getAudioContextClass())()) {}
 
   public addPanicListener(cb: () => void): () => void {
     this.panicListeners.add(cb);
     return () => this.panicListeners.delete(cb);
   }
 
-  public async initAudio(): Promise<boolean> {
+  public initAudio(): Promise<boolean> {
+    if (!this.initialization) {
+      this.initialization = this.initializeAudio().finally(() => { this.initialization = null; });
+    }
+    return this.initialization;
+  }
+
+  private async initializeAudio(): Promise<boolean> {
     if (this.isInitialized && this.ctx) {
       if (this.ctx.state === 'suspended') {
         await this.ctx.resume();
@@ -495,8 +447,7 @@ export class ResonatorAudioEngine {
     }
 
     try {
-      const AudioCtxClass = getAudioContextClass();
-      this.ctx = new AudioCtxClass();
+      this.ctx = this.createContext();
       if (this.ctx.state === 'suspended') {
         await this.ctx.resume();
       }
@@ -507,6 +458,7 @@ export class ResonatorAudioEngine {
       this.setupMidi();
 
       this.isInitialized = true;
+      this.updatePatches(this.activePatches);
       return true;
     } catch (e) {
       console.warn('AudioContext failed to initialize:', e);
@@ -606,7 +558,7 @@ export class ResonatorAudioEngine {
     this.lfoOsc.frequency.setValueAtTime(this.params.lfoRate, this.ctx.currentTime);
 
     this.lfoGainToFilter = this.ctx.createGain();
-    const lfoAmount = this.params.lfoDepth * (this.params.cutoff * 0.6);
+    const lfoAmount = (this.params.lfoDepth + this.modWheelAmount * 0.6) * (this.params.cutoff * 0.6);
     this.lfoGainToFilter.gain.setValueAtTime(lfoAmount, this.ctx.currentTime);
 
     this.lfoOsc.connect(this.lfoGainToFilter);
@@ -620,13 +572,6 @@ export class ResonatorAudioEngine {
     this.lfoGainToRes.gain.setValueAtTime(0, this.ctx.currentTime);
     this.lfoOsc.connect(this.lfoGainToRes);
     this.lfoGainToRes.connect(this.masterFilter.Q);
-
-    this.subGainToPitch = this.ctx.createGain();
-    this.subGainToPitch.gain.setValueAtTime(0, this.ctx.currentTime);
-
-    this.subGainToRes = this.ctx.createGain();
-    this.subGainToRes.gain.setValueAtTime(0, this.ctx.currentTime);
-    this.subGainToRes.connect(this.masterFilter.Q);
 
     if (this.noiseBuffer) {
       this.noiseSourceGlobal = this.ctx.createBufferSource();
@@ -665,17 +610,25 @@ export class ResonatorAudioEngine {
         let connectedCount = 0;
         for (const input of midiAccess.inputs.values()) {
           connectedCount++;
-          input.onmidimessage = (msg) => this.handleMidiMessage(msg);
+          input.onmidimessage = (msg) => this.handleMidiMessage(msg, input.id);
         }
         if (this.onMidiStatusChange) {
           this.onMidiStatusChange(connectedCount > 0 ? `MIDI CONECTADO (${connectedCount})` : 'MIDI LISTO');
         }
 
-        midiAccess.onstatechange = () => {
+        midiAccess.onstatechange = (event) => {
+          const port = event.port;
+          if (port?.type === 'input' && port.state === 'disconnected') {
+            for (let channel = 0; channel < 16; channel++) {
+              const source = 'midi:' + port.id + ':' + channel;
+              this.setSustainPedal(false, source);
+              this.releaseSource(source);
+            }
+          }
           let count = 0;
           for (const input of midiAccess.inputs.values()) {
             count++;
-            input.onmidimessage = (msg) => this.handleMidiMessage(msg);
+            input.onmidimessage = (msg) => this.handleMidiMessage(msg, input.id);
           }
           if (this.onMidiStatusChange) {
             this.onMidiStatusChange(count > 0 ? `MIDI CONECTADO (${count})` : 'MIDI LISTO');
@@ -687,21 +640,22 @@ export class ResonatorAudioEngine {
       });
   }
 
-  private handleMidiMessage(event: { data: Uint8Array | number[] | null }) {
+  private handleMidiMessage(event: { data: Uint8Array | number[] | null }, device = 'default') {
     if (!event.data) return;
     const [status, data1, data2] = event.data;
     const command = status >> 4;
+    const source = 'midi:' + device + ':' + (status & 15);
 
     switch (command) {
       case 0x9: // Note On
         if (data2 > 0) {
-          this.triggerAttack(data1, data2 / 127, 'midi');
+          this.triggerAttack(data1, data2 / 127, source);
         } else {
-          this.triggerRelease(data1, 'midi');
+          this.triggerRelease(data1, source);
         }
         break;
       case 0x8: // Note Off
-        this.triggerRelease(data1, 'midi');
+        this.triggerRelease(data1, source);
         break;
       case 0xe: // Pitch Bend
         const bend = ((data2 << 7) + data1 - 8192) / 8192;
@@ -711,7 +665,7 @@ export class ResonatorAudioEngine {
         if (data1 === 1) {
           this.setModWheel(data2 / 127);
         } else if (data1 === 64) {
-          this.setSustainPedal(data2 >= 64);
+          this.setSustainPedal(data2 >= 64, source);
         }
         break;
     }
@@ -726,8 +680,17 @@ export class ResonatorAudioEngine {
     source: string = 'keyboard',
     startTime?: number
   ): void {
-    if (!this.ctx || !this.voicesMixBus) {
-      this.initAudio().then(() => this.triggerAttack(midiNote, velocity, source, startTime));
+    if (!this.isInitialized || !this.ctx || !this.voicesMixBus) {
+      const generation = this.generation;
+      const key = source + ':' + midiNote;
+      const token = Symbol();
+      this.pendingAttacks.set(key, token);
+      this.initAudio().then(ok => {
+        if (ok && generation === this.generation && this.pendingAttacks.get(key) === token) {
+          this.pendingAttacks.delete(key);
+          this.triggerAttack(midiNote, velocity, source, startTime);
+        }
+      });
       return;
     }
 
@@ -736,6 +699,7 @@ export class ResonatorAudioEngine {
     }
 
     if (this.params.arpEnabled) {
+      this.arpInputs.set(source + ':' + midiNote, midiNote);
       if (!this.heldArpNotes.includes(midiNote)) {
         this.heldArpNotes.push(midiNote);
       }
@@ -746,13 +710,14 @@ export class ResonatorAudioEngine {
     this.spawnVoice(midiNote, velocity, source, undefined, startTime);
   }
 
-  public setSustainPedal(isDown: boolean): void {
-    this.isSustainPedalDown = isDown;
-    if (!isDown) {
-      for (const note of this.sustainedMidiNotes) {
-        this.triggerRelease(note);
+  public setSustainPedal(isDown: boolean, source = '*'): void {
+    if (isDown) this.sustainSources.add(source);
+    else this.sustainSources.delete(source);
+    for (const id of this.sustainedVoices) {
+      const voice = this.activeVoices.get(id);
+      if (voice && !this.sustainSources.has('*') && !this.sustainSources.has(voice.source)) {
+        this.releaseVoice(voice);
       }
-      this.sustainedMidiNotes.clear();
     }
   }
 
@@ -795,12 +760,10 @@ export class ResonatorAudioEngine {
     if (!this.ctx || !this.voicesMixBus) return;
     const now = Math.max(startTime ?? this.ctx.currentTime, this.ctx.currentTime);
 
-    this.sustainedMidiNotes.delete(midiNote);
-
     // Micro-crossfade any active voice of same midiNote (smooth retrigger)
     for (const [key, voice] of Array.from(this.activeVoices.entries())) {
-      if (voice.note === midiNote) {
-        voice.microFadeOutAndDispose(now);
+      if (voice.note === midiNote && voice.source === source) {
+        this.retireVoice(voice, now);
         this.activeVoices.delete(key);
       }
     }
@@ -809,7 +772,7 @@ export class ResonatorAudioEngine {
     if (this.activeVoices.size >= ResonatorAudioEngine.MAX_POLYPHONY) {
       const victim = this.selectVoiceToSteal();
       if (victim) {
-        victim.microFadeOutAndDispose(now);
+        this.retireVoice(victim, now);
         this.activeVoices.delete(victim.id);
       }
     }
@@ -822,12 +785,15 @@ export class ResonatorAudioEngine {
       this.noiseBuffer,
       this.pitchBendSemitones,
       this.lfoGainToPitch,
-      this.subGainToPitch,
       source,
       now
     );
 
     this.activeVoices.set(voice.id, voice);
+    voice.updateSubPatches(
+      this.activePatches.some(c => c.fromId === 'sub-out' && c.toId === 'vco-pitch'),
+      this.activePatches.some(c => c.fromId === 'sub-out' && c.toId === 'vcf-res')
+    );
     this.updateMasterVcaGate(now);
     voice.triggerAttack(velocity, now);
 
@@ -842,38 +808,57 @@ export class ResonatorAudioEngine {
     }
   }
 
+  private retireVoice(voice: SynthVoice, time: number): void {
+    this.sustainedVoices.delete(voice.id);
+    this.fadingVoices.add(voice);
+    voice.microFadeOutAndDispose(time, () => this.fadingVoices.delete(voice));
+  }
+
+  private releaseVoice(voice: SynthVoice, time?: number): void {
+    this.sustainedVoices.delete(voice.id);
+    voice.triggerRelease(time, () => {
+      this.activeVoices.delete(voice.id);
+      if (this.ctx) this.updateMasterVcaGate(this.ctx.currentTime, 0.05);
+    });
+  }
+
   /**
    * Release Trigger matching note & source with sample-accurate clock
    */
   public triggerRelease(midiNote: number, source?: string, startTime?: number): void {
+    this.pendingAttacks.delete((source ?? 'keyboard') + ':' + midiNote);
     if (this.params.arpEnabled) {
-      this.heldArpNotes = this.heldArpNotes.filter((n) => n !== midiNote);
-      if (this.heldArpNotes.length === 0) {
-        this.stopArpeggiator();
-      }
-    }
-
-    if (this.isSustainPedalDown) {
-      this.sustainedMidiNotes.add(midiNote);
-      return;
+      this.arpInputs.delete((source ?? 'keyboard') + ':' + midiNote);
+      this.heldArpNotes = [...new Set(this.arpInputs.values())];
+      if (this.heldArpNotes.length === 0) this.stopArpeggiator();
     }
 
     if (!this.ctx) return;
     const now = Math.max(startTime ?? this.ctx.currentTime, this.ctx.currentTime);
-
-    // Find non-releasing voice matching note
-    for (const [key, voice] of Array.from(this.activeVoices.entries())) {
-      if (voice.note === midiNote && (!source || voice.source === source) && !voice.isReleasing) {
-        voice.triggerRelease(now, () => {
-          this.activeVoices.delete(key);
-          if (this.ctx) {
-            this.updateMasterVcaGate(this.ctx.currentTime, 0.05);
-          }
-        });
+    for (const voice of this.activeVoices.values()) {
+      if (voice.note !== midiNote || voice.source !== (source ?? 'keyboard') || voice.isReleasing) continue;
+      if ((this.sustainSources.has('*') || this.sustainSources.has(voice.source)) && voice.source !== 'demo' && voice.source !== 'arp') {
+        this.sustainedVoices.add(voice.id);
+      } else {
+        this.releaseVoice(voice, now);
       }
     }
 
     this.updateMasterVcaGate(now, this.params.release);
+  }
+
+  public releaseSource(source: string): void {
+    for (const key of this.pendingAttacks.keys()) {
+      if (key.startsWith(source + ':')) this.pendingAttacks.delete(key);
+    }
+    for (const [key] of this.arpInputs) {
+      if (key.startsWith(source + ':')) this.arpInputs.delete(key);
+    }
+    this.heldArpNotes = [...new Set(this.arpInputs.values())];
+    if (this.heldArpNotes.length === 0) this.stopArpeggiator();
+    for (const voice of this.activeVoices.values()) {
+      if (voice.source === source) this.releaseVoice(voice);
+    }
   }
 
   public noteOn(midiNote: number, velocity: number = 0.85): void {
@@ -889,6 +874,9 @@ export class ResonatorAudioEngine {
    * Clears active voices, demo timers, sustain, arpeggiator, and rebuilds delay node without leaks.
    */
   public panic(): void {
+    this.generation++;
+    for (const voice of this.fadingVoices) voice.dispose();
+    this.fadingVoices.clear();
     // Notify UI / App listeners to cancel pending demo timers
     for (const cb of this.panicListeners) {
       try { cb(); } catch {}
@@ -899,8 +887,10 @@ export class ResonatorAudioEngine {
     }
     this.activeVoices.clear();
     this.heldArpNotes = [];
-    this.sustainedMidiNotes.clear();
-    this.isSustainPedalDown = false;
+    this.sustainedVoices.clear();
+    this.sustainSources.clear();
+    this.pendingAttacks.clear();
+    this.arpInputs.clear();
     this.stopArpeggiator();
 
     if (!this.ctx) return;
@@ -1008,9 +998,15 @@ export class ResonatorAudioEngine {
       clearTimeout(this.arpTimerId);
       this.arpTimerId = null;
     }
-    if (this.currentArpNote !== null) {
-      this.triggerRelease(this.currentArpNote, 'arp');
-      this.currentArpNote = null;
+    for (const [id, voice] of this.activeVoices) {
+      if (voice.source === 'arp') {
+        if (this.ctx && voice.createdAtTime > this.ctx.currentTime) {
+          voice.dispose();
+          this.activeVoices.delete(id);
+        } else {
+          this.releaseVoice(voice);
+        }
+      }
     }
     if (this.ctx) {
       this.updateMasterVcaGate(this.ctx.currentTime, 0.05);
@@ -1053,6 +1049,10 @@ export class ResonatorAudioEngine {
         for (const voice of this.activeVoices.values()) {
           voice.mainOsc.type = value as OscillatorType;
         }
+        break;
+
+      case 'octave':
+        this.setPitchBend(this.pitchBendSemitones);
         break;
 
       case 'detune':
@@ -1134,9 +1134,12 @@ export class ResonatorAudioEngine {
       case 'arpEnabled':
         if (!(value as boolean)) {
           this.stopArpeggiator();
+          this.arpInputs.clear();
+          this.heldArpNotes = [];
         }
         break;
     }
+    if (['cutoff', 'lfoDepth', 'noiseLevel', 'subLevel'].includes(key)) this.updatePatches(this.activePatches);
   }
 
   public setPitchBend(semitones: number): void {
@@ -1144,7 +1147,7 @@ export class ResonatorAudioEngine {
     if (!this.ctx) return;
     const factor = Math.pow(2, semitones / 12);
     for (const voice of this.activeVoices.values()) {
-      voice.updatePitch(voice.frequency * factor);
+      voice.updatePitch(midiToFrequency(voice.note + this.params.octave * 12) * factor);
     }
   }
 
@@ -1152,15 +1155,15 @@ export class ResonatorAudioEngine {
     this.modWheelAmount = amount;
     if (!this.ctx || !this.lfoGainToFilter) return;
     const now = this.ctx.currentTime;
-    const lfoAmt = (this.params.lfoDepth + amount * 0.6) * (this.params.cutoff * 0.7);
-    this.lfoGainToFilter.gain.setTargetAtTime(lfoAmt, now, 0.015);
+    this.updatePatches(this.activePatches);
   }
 
   /**
    * Real Patch Matrix Node Routing with Exact Named Audio Sources
    */
   public updatePatches(cables: Array<{ fromId: string; toId: string }>): void {
-    this.activePatches = cables;
+    this.activePatches = cables.filter(isSupportedPatch);
+    cables = this.activePatches;
     if (!this.ctx) return;
     const now = this.ctx.currentTime;
 
@@ -1171,9 +1174,8 @@ export class ResonatorAudioEngine {
     if (this.lfoGainToPitch) {
       this.lfoGainToPitch.gain.setTargetAtTime(lfoToPitch ? 35 : 0, now, 0.02);
     }
-    if (this.subGainToPitch) {
-      this.subGainToPitch.gain.setTargetAtTime(subToPitch ? 15 : 0, now, 0.02);
-    }
+    const subToRes = cables.some(c => c.fromId === 'sub-out' && c.toId === 'vcf-res');
+    for (const voice of this.activeVoices.values()) voice.updateSubPatches(subToPitch, subToRes);
 
     if (this.masterFilter) {
       // 2. Cutoff Modulations
@@ -1181,26 +1183,24 @@ export class ResonatorAudioEngine {
       const noiseToCut = cables.some((c) => c.fromId === 'noise-out' && c.toId === 'vcf-cut');
 
       if (this.lfoGainToFilter) {
-        const baseLfoAmt = this.params.lfoDepth * (this.params.cutoff * 0.6);
+        const baseLfoAmt = (this.params.lfoDepth + this.modWheelAmount * 0.6) * (this.params.cutoff * 0.6);
         const lfoCutAmt = lfoToCut ? baseLfoAmt * 2.5 : baseLfoAmt;
         this.lfoGainToFilter.gain.setTargetAtTime(lfoCutAmt, now, 0.02);
       }
 
       if (this.noiseGainToFilter) {
-        const noiseAmt = noiseToCut ? 1400 * (this.params.noiseLevel || 0.2) : 0;
+        const noiseAmt = noiseToCut ? 1400 * this.params.noiseLevel : 0;
         this.noiseGainToFilter.gain.setTargetAtTime(noiseAmt, now, 0.02);
       }
 
       // 3. Resonance Q Modulations
       const lfoToRes = cables.some((c) => c.fromId === 'lfo-out' && c.toId === 'vcf-res');
-      const subToRes = cables.some((c) => c.fromId === 'sub-out' && c.toId === 'vcf-res');
+
 
       if (this.lfoGainToRes) {
         this.lfoGainToRes.gain.setTargetAtTime(lfoToRes ? 4.5 : 0, now, 0.02);
       }
-      if (this.subGainToRes) {
-        this.subGainToRes.gain.setTargetAtTime(subToRes ? 3.5 * (this.params.subLevel || 0.3) : 0, now, 0.02);
-      }
+
     }
   }
 
